@@ -16,6 +16,1108 @@ import org.json.JSONObject
 import java.io.File
 import kotlin.math.pow
 
+/** Тип поля спайковой транзакции. */
+enum class SpikeFieldKind {
+    // Поле, которое будет синтезироваться в память (например, w, tag)
+    SYNAPTIC_PARAM,
+    // Поле, используемое для реализации синаптической задержки
+    DELAY
+}
+
+/** Дескриптор поля спайковой транзакции. */
+class SpikeField(
+    var name: String,
+    var width: Int,
+    var kind: SpikeFieldKind
+)
+
+/** Ссылка на поле (для будущего использования в AST/IR). */
+class SpikeFieldRef(var name: String)
+
+/* ===== 0) Опкоды и операнды (Spike) ===== */
+
+enum class SpikeOpCode {
+    ADD,   // +
+    SUB,   // -
+    SHL,   // <<
+    SHR    // >>
+}
+
+/** Операнд: поле/константа. Поддержка внешних (нейронных) полей. */
+class SpikeOperand {
+    var isImm: Boolean = false
+    var fieldName: String? = null
+
+    // внешняя ссылка
+    var isExternal: Boolean = false
+    var extSpace: String? = null   // например, "NEURON"
+    var imm: Int = 0
+
+    companion object {
+        fun field(name: String): SpikeOperand {
+            val o = SpikeOperand()
+            o.isImm = false
+            o.fieldName = name
+            return o
+        }
+        fun imm(value: Int): SpikeOperand {
+            val o = SpikeOperand()
+            o.isImm = true
+            o.imm = value
+            return o
+        }
+        /** Ссылка на поле из NeuronTx: neuron.<name> */
+        fun neuronField(name: String): SpikeOperand {
+            val o = SpikeOperand()
+            o.isImm = false
+            o.fieldName = name
+            o.isExternal = true
+            o.extSpace = "NEURON"
+            return o
+        }
+    }
+}
+
+/** Узел операции (AST-узел) для SpikeTx. */
+class SpikeOperation(
+    val opcode: SpikeOpCode,
+    val dst: String,              // имя поля: локальное или внешнее
+    val a: SpikeOperand,
+    val b: SpikeOperand,
+    val dstIsExternal: Boolean = false,
+    val dstExtSpace: String? = null  // "NEURON" и т.п.
+)
+/* ===== 1) SpikeTx с поддержкой операций ===== */
+
+class SpikeTx {
+
+    // Поля
+    private val fields = mutableListOf<SpikeField>()
+
+    // Список операций над полями этой транзакции
+    private val ops = mutableListOf<SpikeOperation>()
+
+    fun addField(
+        name: String,
+        width: Int,
+        kind: SpikeFieldKind = SpikeFieldKind.SYNAPTIC_PARAM
+    ): SpikeFieldRef {
+        for (f in fields) {
+            if (f.name == name) {
+                println("Ошибка: поле с именем '$name' уже существует.")
+                return SpikeFieldRef(name)
+            }
+        }
+        val field = SpikeField(name, width, kind)
+        fields.add(field)
+        return SpikeFieldRef(name)
+    }
+
+    fun getField(name: String): SpikeField? {
+        for (f in fields) if (f.name == name) return f
+        return null
+    }
+
+    fun hasField(name: String): Boolean {
+        for (f in fields) if (f.name == name) return true
+        return false
+    }
+
+    fun listFields() {
+        println("Список полей:")
+        for (f in fields) println("  ${f.name} (${f.width} бит) тип=${f.kind}")
+    }
+
+    // ===== Базовые операции: +, -, <<, >> =====
+// --- ВНЕШНИЕ операции: обновление поля нейрона ---
+    fun opAddExt(dstNeuronName: String, a: SpikeOperand, b: SpikeOperand) {
+        ops.add(
+            SpikeOperation(
+                SpikeOpCode.ADD,
+                dstNeuronName,
+                a, b,
+                dstIsExternal = true,
+                dstExtSpace = "NEURON"
+            )
+        )
+    }
+
+    fun opSubExt(dstNeuronName: String, a: SpikeOperand, b: SpikeOperand) {
+        ops.add(
+            SpikeOperation(
+                SpikeOpCode.SUB,
+                dstNeuronName,
+                a, b,
+                dstIsExternal = true,
+                dstExtSpace = "NEURON"
+            )
+        )
+    }
+
+    fun opShlExt(dstNeuronName: String, a: SpikeOperand, shiftImm: Int) {
+        ops.add(
+            SpikeOperation(
+                SpikeOpCode.SHL,
+                dstNeuronName,
+                a, SpikeOperand.imm(shiftImm),
+                dstIsExternal = true,
+                dstExtSpace = "NEURON"
+            )
+        )
+    }
+
+    fun opShrExt(dstNeuronName: String, a: SpikeOperand, shiftImm: Int) {
+        ops.add(
+            SpikeOperation(
+                SpikeOpCode.SHR,
+                dstNeuronName,
+                a, SpikeOperand.imm(shiftImm),
+                dstIsExternal = true,
+                dstExtSpace = "NEURON"
+            )
+        )
+    }
+
+    // --- ЛОКАЛЬНЫЕ операции ТОЛЬКО ДЛЯ ЗАДЕРЖКИ ---
+    private fun requireDelay(name: String): Boolean {
+        val f = getField(name)
+        if (f == null) { println("Ошибка: локальное поле '$name' не найдено."); return false }
+        if (f.kind != SpikeFieldKind.DELAY) {
+            println("Ошибка: допустимы только операции над полями DELAY (поле '$name' имеет тип ${f.kind}).")
+            return false
+        }
+        return true
+    }
+
+    fun opDelayAddImm(delayField: String, imm: Int) {
+        if (!requireDelay(delayField)) return
+        ops.add(SpikeOperation(SpikeOpCode.ADD, delayField, SpikeOperand.field(delayField), SpikeOperand.imm(imm)))
+    }
+
+    fun opDelaySubImm(delayField: String, imm: Int) {
+        if (!requireDelay(delayField)) return
+        ops.add(SpikeOperation(SpikeOpCode.SUB, delayField, SpikeOperand.field(delayField), SpikeOperand.imm(imm)))
+    }
+
+    fun opDelayShlImm(delayField: String, imm: Int) {
+        if (!requireDelay(delayField)) return
+        ops.add(SpikeOperation(SpikeOpCode.SHL, delayField, SpikeOperand.field(delayField), SpikeOperand.imm(imm)))
+    }
+
+    fun opDelayShrImm(delayField: String, imm: Int) {
+        if (!requireDelay(delayField)) return
+        ops.add(SpikeOperation(SpikeOpCode.SHR, delayField, SpikeOperand.field(delayField), SpikeOperand.imm(imm)))
+    }
+
+    // ===== Сервис для последующих этапов (AST/IR) =====
+
+    /** Снимок списка всех полей спайковой транзакции (для мидлвари). */
+    fun listFieldsSnapshot(): List<SpikeField> = fields.toList()
+
+    fun listOps(): List<SpikeOperation> = ops.toList()
+
+    fun dumpOps() {
+        println("Операции SpikeTx:")
+        for (op in ops) {
+            val aStr = if (op.a.isImm) "imm=${op.a.imm}" else "field=${op.a.fieldName}"
+            val bStr = if (op.b.isImm) "imm=${op.b.imm}" else "field=${op.b.fieldName}"
+
+            val dstInfo = buildString {
+                append("dst=${op.dst}")
+                if (op.dstIsExternal)
+                    append(" (external space=${op.dstExtSpace})")
+            }
+
+            println("  opcode=${op.opcode}, $dstInfo, a=($aStr), b=($bStr)")
+        }
+    }
+}
+
+// NeuronTx.kt — минимальный класс нейронной транзакции (согласовано)
+
+// NeuronTx.kt — минимальный класс нейронной транзакции (с EMIT и REFRACTORY)
+
+/** Тип поля нейронной транзакции. */
+enum class NeuronFieldKind {
+    DYNAMIC,          // динамический параметр (Vmemb и т.п.)
+    STATIC,           // статический параметр (Vthr, leakK, Vrst)
+    EMIT_PREDICATE,   // предикат/флаг эмиссии спайка
+    REFRACTORY        // параметры/состояния для пост-эмиссии (рефракторный период)
+}
+
+/** Дескриптор поля нейронной транзакции. */
+class NeuronField(
+    var name: String,
+    var width: Int,
+    var kind: NeuronFieldKind
+)
+
+/** Ссылка на поле (для будущего использования в AST/IR). */
+class NeuronFieldRef(var name: String)
+
+/** Опкоды базовых операций. */
+enum class NeuronOpCode {
+    ADD,   // +
+    SUB,   // -
+    SHL,   // <<
+    SHR,   // >>
+    EMIT,  // эмиссия спайка по предикату
+    CMP_GE, // dstPredicate = (a >= b)
+    EMIT_IF
+}
+
+// Операторы сравнения
+// Операторы сравнения
+enum class NeuronCmp {
+    GT, LT, GE, LE,
+    EQ, NE   // <- добавили для внутреннего использования (== и !=)
+}
+//enum class NeuronCmp {
+//    GT, LT, GE, LE
+//}
+
+// Условие для if: (a ? b)
+class NeuronCond(
+    var cmp: NeuronCmp,
+    var a: NeuronOperand,
+    var b: NeuronOperand
+)
+
+/** Операнд операции: поле или константа. */
+class NeuronOperand {
+    var isImm: Boolean = false
+    var fieldName: String? = null
+    var imm: Int = 0
+
+    companion object {
+        fun field(name: String): NeuronOperand {
+            val o = NeuronOperand()
+            o.isImm = false
+            o.fieldName = name
+            return o
+        }
+        fun imm(value: Int): NeuronOperand {
+            val o = NeuronOperand()
+            o.isImm = true
+            o.imm = value
+            return o
+        }
+    }
+}
+
+/** Узел операции. */
+class NeuronOperation(
+    val opcode: NeuronOpCode,
+    val dst: String,           // назначение: имя поля ИЛИ служебное имя для EMIT (напр. "spike_out")
+    val a: NeuronOperand,      // аргумент A: для EMIT — это предикат (поле)
+    val b: NeuronOperand,       // аргумент B: не используется для EMIT (можно 0)
+    val cmp: NeuronCmp? = null,   // GT/LT/GE/LE для EMIT_IF
+    val resetDst: String? = null, // поле для сброса (или null)
+    val resetImm: Int? = null     // константа сброса (или null)
+)
+
+/**
+ * Нейронная транзакция: контейнер полей и список операций.
+ * Типы полей: DYNAMIC / STATIC / EMIT_PREDICATE / REFRACTORY.
+ */
+class NeuronTx {
+
+    // Поля
+    private val fields = mutableListOf<NeuronField>()
+
+    // Операции над полями
+    private val ops = mutableListOf<NeuronOperation>()
+
+    /**
+     * Добавить поле в транзакцию.
+     * name — имя поля
+     * width — разрядность (бит)
+     * kind — тип поля (по умолчанию DYNAMIC)
+     */
+    fun addField(name: String, width: Int, kind: NeuronFieldKind = NeuronFieldKind.DYNAMIC): NeuronFieldRef {
+        // Проверка уникальности имени
+        for (f in fields) {
+            if (f.name == name) {
+                println("Ошибка: поле с именем '$name' уже существует.")
+                return NeuronFieldRef(name)
+            }
+        }
+        val field = NeuronField(name, width, kind)
+        fields.add(field)
+        return NeuronFieldRef(name)
+    }
+
+    /** Получить поле по имени (или null). */
+    fun getField(name: String): NeuronField? {
+        for (f in fields) if (f.name == name) return f
+        return null
+    }
+
+    /** Есть ли поле с таким именем. */
+    fun hasField(name: String): Boolean {
+        for (f in fields) if (f.name == name) return true
+        return false
+    }
+
+    /** Показать все поля (для отладки). */
+    fun listFields() {
+        println("Поля NeuronTx:")
+        for (f in fields) {
+            println("  ${f.name} (${f.width} бит) тип=${f.kind}")
+        }
+    }
+
+    // ===== Базовые операции: +, -, <<, >> =====
+
+    fun opAdd(dst: String, aField: String, bField: String) {
+        if (!hasField(dst) || !hasField(aField) || !hasField(bField)) {
+            println("Ошибка: одно из полей не найдено (dst/a/b)."); return
+        }
+        ops.add(NeuronOperation(NeuronOpCode.ADD, dst, NeuronOperand.field(aField), NeuronOperand.field(bField)))
+    }
+    fun opAddImm(dst: String, aField: String, imm: Int) {
+        if (!hasField(dst) || !hasField(aField)) {
+            println("Ошибка: поле dst или a не найдено."); return
+        }
+        ops.add(NeuronOperation(NeuronOpCode.ADD, dst, NeuronOperand.field(aField), NeuronOperand.imm(imm)))
+    }
+
+    fun opSub(dst: String, aField: String, bField: String) {
+        if (!hasField(dst) || !hasField(aField) || !hasField(bField)) {
+            println("Ошибка: одно из полей не найдено (dst/a/b)."); return
+        }
+        ops.add(NeuronOperation(NeuronOpCode.SUB, dst, NeuronOperand.field(aField), NeuronOperand.field(bField)))
+    }
+    fun opSubImm(dst: String, aField: String, imm: Int) {
+        if (!hasField(dst) || !hasField(aField)) {
+            println("Ошибка: поле dst или a не найдено."); return
+        }
+        ops.add(NeuronOperation(NeuronOpCode.SUB, dst, NeuronOperand.field(aField), NeuronOperand.imm(imm)))
+    }
+
+    fun opShlImm(dst: String, aField: String, shift: Int) {
+        if (!hasField(dst) || !hasField(aField)) {
+            println("Ошибка: поле dst или a не найдено."); return
+        }
+        ops.add(NeuronOperation(NeuronOpCode.SHL, dst, NeuronOperand.field(aField), NeuronOperand.imm(shift)))
+    }
+
+    fun opShrImm(dst: String, aField: String, shift: Int) {
+        if (!hasField(dst) || !hasField(aField)) {
+            println("Ошибка: поле dst или a не найдено."); return
+        }
+        ops.add(NeuronOperation(NeuronOpCode.SHR, dst, NeuronOperand.field(aField), NeuronOperand.imm(shift)))
+    }
+
+    // ===== Сравнение: fired = (aField >= bField) =====
+    fun opCmpGe(dstPredicate: String, aField: String, bField: String) {
+        // проверки существования полей
+        if (!hasField(dstPredicate) || !hasField(aField) || !hasField(bField)) {
+            println("Ошибка: одно из полей не найдено (dstPredicate/aField/bField)."); return
+        }
+
+        // предупреждения/валидация типа предиката
+        val dst = getField(dstPredicate)
+        if (dst != null) {
+            if (dst.kind != NeuronFieldKind.EMIT_PREDICATE) {
+                println("Предупреждение: поле '$dstPredicate' имеет тип ${dst.kind}, ожидается EMIT_PREDICATE.")
+            }
+            if (dst.width != 1) {
+                println("Предупреждение: поле-предикат '$dstPredicate' имеет ширину ${dst.width}, обычно ожидается 1 бит.")
+            }
+        }
+
+        ops.add(
+            NeuronOperation(
+                NeuronOpCode.CMP_GE,
+                dstPredicate,
+                NeuronOperand.field(aField),
+                NeuronOperand.field(bField)
+            )
+        )
+    }
+    // ===== Сравнение: fired = (aField >= imm) =====
+    fun opCmpGeImm(dstPredicate: String, aField: String, imm: Int) {
+        if (!hasField(dstPredicate) || !hasField(aField)) {
+            println("Ошибка: поле dstPredicate или aField не найдено."); return
+        }
+
+        val dst = getField(dstPredicate)
+        if (dst != null) {
+            if (dst.kind != NeuronFieldKind.EMIT_PREDICATE) {
+                println("Предупреждение: поле '$dstPredicate' имеет тип ${dst.kind}, ожидается EMIT_PREDICATE.")
+            }
+            if (dst.width != 1) {
+                println("Предупреждение: поле-предикат '$dstPredicate' имеет ширину ${dst.width}, обычно ожидается 1 бит.")
+            }
+        }
+
+        ops.add(
+            NeuronOperation(
+                NeuronOpCode.CMP_GE,
+                dstPredicate,
+                NeuronOperand.field(aField),
+                NeuronOperand.imm(imm)
+            )
+        )
+    }
+
+    // ===== Секция helpers условий (добавить внутрь NeuronTx) =====
+    private fun cond(cmp: NeuronCmp, a: NeuronOperand, b: NeuronOperand): NeuronCond =
+        NeuronCond(cmp, a, b)
+
+    fun ifGt(aField: String, bField: String): NeuronCond {
+        if (!hasField(aField) || !hasField(bField)) {
+            println("Ошибка: поле для сравнения не найдено (ifGt: $aField|$bField).");
+        }
+        return cond(NeuronCmp.GT, NeuronOperand.field(aField), NeuronOperand.field(bField))
+    }
+    fun ifGtImm(aField: String, imm: Int): NeuronCond {
+        if (!hasField(aField)) { println("Ошибка: поле для сравнения не найдено (ifGtImm: $aField).") }
+        return cond(NeuronCmp.GT, NeuronOperand.field(aField), NeuronOperand.imm(imm))
+    }
+
+    fun ifLt(aField: String, bField: String): NeuronCond {
+        if (!hasField(aField) || !hasField(bField)) {
+            println("Ошибка: поле для сравнения не найдено (ifLt: $aField|$bField).");
+        }
+        return cond(NeuronCmp.LT, NeuronOperand.field(aField), NeuronOperand.field(bField))
+    }
+    fun ifLtImm(aField: String, imm: Int): NeuronCond {
+        if (!hasField(aField)) { println("Ошибка: поле для сравнения не найдено (ifLtImm: $aField).") }
+        return cond(NeuronCmp.LT, NeuronOperand.field(aField), NeuronOperand.imm(imm))
+    }
+
+    fun ifGe(aField: String, bField: String): NeuronCond {
+        if (!hasField(aField) || !hasField(bField)) {
+            println("Ошибка: поле для сравнения не найдено (ifGe: $aField|$bField).");
+        }
+        return cond(NeuronCmp.GE, NeuronOperand.field(aField), NeuronOperand.field(bField))
+    }
+    fun ifGeImm(aField: String, imm: Int): NeuronCond {
+        if (!hasField(aField)) { println("Ошибка: поле для сравнения не найдено (ifGeImm: $aField).") }
+        return cond(NeuronCmp.GE, NeuronOperand.field(aField), NeuronOperand.imm(imm))
+    }
+
+    fun ifLe(aField: String, bField: String): NeuronCond {
+        if (!hasField(aField) || !hasField(bField)) {
+            println("Ошибка: поле для сравнения не найдено (ifLe: $aField|$bField).");
+        }
+        return cond(NeuronCmp.LE, NeuronOperand.field(aField), NeuronOperand.field(bField))
+    }
+    fun ifLeImm(aField: String, imm: Int): NeuronCond {
+        if (!hasField(aField)) { println("Ошибка: поле для сравнения не найдено (ifLeImm: $aField).") }
+        return cond(NeuronCmp.LE, NeuronOperand.field(aField), NeuronOperand.imm(imm))
+    }
+
+    // ===== Операция эмиссии спайка =====
+    /**
+     * Эмиссия спайка при истинном предикате.
+     * @param predicateField имя поля-предиката (должно существовать, обычно kind=EMIT_PREDICATE)
+     * @param outName логическое имя «приёмника» спайка (для IR/бэкенда), по умолчанию "spike_out"
+     *
+     * Представление в операции:
+     *   opcode = EMIT
+     *   dst    = outName
+     *   a      = predicateField
+     *   b      = imm(0)  // зарезервировано, не используется
+     */
+    /** 1) Просто эмиссия по предикату (без сброса). */
+    fun opEmit(predicateField: String, outName: String = "spike_out") {
+        if (!hasField(predicateField)) {
+            println("Ошибка: предикат '$predicateField' не найден."); return
+        }
+        val pf = getField(predicateField)
+        if (pf != null && pf.kind != NeuronFieldKind.EMIT_PREDICATE) {
+            println("Предупреждение: поле '$predicateField' имеет тип ${pf.kind}, ожидается EMIT_PREDICATE.")
+        }
+        // Соглашение: dst = "spike_out" => только эмиссия
+        ops.add(
+            NeuronOperation(
+                NeuronOpCode.EMIT,
+                outName,                             // dst: логическое имя выхода
+                NeuronOperand.field(predicateField), // a: предикат
+                NeuronOperand.imm(0)                 // b: 0 => без сброса
+            )
+        )
+    }
+
+    /**
+     * Соглашение для бэкенда:
+     *   opcode = EMIT
+     *   dst    = имя поля, которое надо сбросить (напр. "Vmemb")
+     *   a      = поле-предикат (например, "fired")
+     *   b      = imm(resetImm)  // константа сброса
+     *
+     * При этом сама эмиссия тоже происходит (как и в простом EMIT).
+     */
+    fun opEmit(predicateField: String, dstReset: String, resetImm: Int) {
+        if (!hasField(predicateField) || !hasField(dstReset)) {
+            println("Ошибка: предикат или поле для сброса не найдено."); return
+        }
+        val pf = getField(predicateField)
+        if (pf != null && pf.kind != NeuronFieldKind.EMIT_PREDICATE) {
+            println("Предупреждение: поле '$predicateField' имеет тип ${pf.kind}, ожидается EMIT_PREDICATE.")
+        }
+        ops.add(
+            NeuronOperation(
+                NeuronOpCode.EMIT,
+                dstReset,                             // dst: поле для сброса (а не "spike_out")
+                NeuronOperand.field(predicateField),  // a: предикат
+                NeuronOperand.imm(resetImm)           // b: константа сброса
+            )
+        )
+    }
+
+    fun opEmitIf(
+        cond: NeuronCond,
+        resetDst: String? = null,
+        resetImm: Int? = null,
+        outName: String = "spike_out"
+    ) {
+        if (resetDst != null && !hasField(resetDst)) {
+            println("Ошибка: поле для сброса '$resetDst' не найдено.");
+            return
+        }
+        ops.add(
+            NeuronOperation(
+                NeuronOpCode.EMIT_IF,
+                dst = outName,
+                a = cond.a,
+                b = cond.b,
+                cmp = cond.cmp,
+                resetDst = resetDst,
+                resetImm = resetImm
+            )
+        )
+    }
+
+
+    // ===== Сервис для последующих этапов =====
+
+    fun listOps(): List<NeuronOperation> = ops.toList()
+
+    fun dumpOps() {
+        println("Операции NeuronTx:")
+        for (op in ops) {
+            val aStr = if (op.a.isImm) "${op.a.imm}" else op.a.fieldName
+            val bStr = if (op.b.isImm) "${op.b.imm}" else op.b.fieldName
+            if (op.opcode == NeuronOpCode.EMIT_IF) {
+                val cmpStr = when (op.cmp) {
+                    NeuronCmp.GT -> ">"
+                    NeuronCmp.LT -> "<"
+                    NeuronCmp.GE -> ">="
+                    NeuronCmp.LE -> "<="
+                    NeuronCmp.EQ -> "=="
+                    NeuronCmp.NE -> "!="
+                    else -> "?"
+                }
+                val resetInfo = if (op.resetDst != null && op.resetImm != null)
+                    ", reset ${op.resetDst} := ${op.resetImm}" else ""
+                println("  EMIT_IF ${op.dst}  if ($aStr $cmpStr $bStr)$resetInfo")
+            } else {
+                println("  ${op.opcode}  ${op.dst} = $aStr , $bStr")
+            }
+        }
+    }
+}
+
+
+
+
+// ===== IR: фазы/опкоды/операнды =====
+enum class TxPhase { SYNAPTIC, NEURONAL }
+
+enum class TxOpcode {
+    ADD, SUB, SHL, SHR,
+    CMP_GE,        // если используешь старую связку CMP+EMIT
+    EMIT,          // "
+    EMIT_IF        // новый «атомарный» emit с условием и опц. сбросом
+}
+
+// Пространства имён полей
+const val SPACE_SPIKE = "SPIKE"
+const val SPACE_NEURON = "NEURON"
+
+// Операнд IR
+data class TxOperand(
+    val isImm: Boolean,
+    val name: String? = null,          // имя поля, если не imm
+    val imm: Int? = null,              // значение, если imm
+    val space: String? = null          // SPIKE / NEURON (для полей)
+)
+
+// Операция IR
+data class TxOp(
+    val phase: TxPhase,
+    val opcode: TxOpcode,
+    val dst: String,                   // имя поля/выхода
+    val dstSpace: String? = null,      // куда пишем (SPIKE/NEURON/лог. "spike_out")
+    val a: TxOperand? = null,
+    val b: TxOperand? = null,
+    // для EMIT_IF:
+    val cmp: NeuronCmp? = null,        // GT/LT/GE/LE
+    val resetDst: String? = null,      // поле сброса (или null)
+    val resetImm: Int? = null          // значение сброса (или null)
+)
+
+// Целостный IR «на такт»
+data class TxIR(val ops: MutableList<TxOp> = mutableListOf())
+
+
+// ===== Вспомогательные адаптеры к IR-операндам =====
+private fun SpikeOperand.toTxOperand(): TxOperand =
+    if (isImm) TxOperand(true, null, imm, null)
+    else TxOperand(false, fieldName, null, if (isExternal) (extSpace ?: SPACE_SPIKE) else SPACE_SPIKE)
+
+private fun NeuronOperand.toTxOperand(): TxOperand =
+    if (isImm) TxOperand(true, null, imm, null)
+    else TxOperand(false, fieldName, null, SPACE_NEURON)
+
+// ===== Построение IR из SpikeTx =====
+fun SpikeTx.toIR(): List<TxOp> {
+    val out = mutableListOf<TxOp>()
+    for (op in listOps()) {
+        val opcode = when (op.opcode) {
+            SpikeOpCode.ADD -> TxOpcode.ADD
+            SpikeOpCode.SUB -> TxOpcode.SUB
+            SpikeOpCode.SHL -> TxOpcode.SHL
+            SpikeOpCode.SHR -> TxOpcode.SHR
+        }
+        val dstSpace = if (op.dstIsExternal) (op.dstExtSpace ?: SPACE_NEURON) else SPACE_SPIKE
+        out += TxOp(
+            phase = TxPhase.SYNAPTIC,
+            opcode = opcode,
+            dst = op.dst,
+            dstSpace = dstSpace,
+            a = op.a.toTxOperand(),
+            b = op.b.toTxOperand()
+        )
+    }
+    return out
+}
+
+// ===== Построение IR из NeuronTx =====
+fun NeuronTx.toIR(): List<TxOp> {
+    val out = mutableListOf<TxOp>()
+    for (op in listOps()) {
+        when (op.opcode) {
+            NeuronOpCode.ADD, NeuronOpCode.SUB, NeuronOpCode.SHL, NeuronOpCode.SHR -> {
+                val opcode = when (op.opcode) {
+                    NeuronOpCode.ADD -> TxOpcode.ADD
+                    NeuronOpCode.SUB -> TxOpcode.SUB
+                    NeuronOpCode.SHL -> TxOpcode.SHL
+                    NeuronOpCode.SHR -> TxOpcode.SHR
+                    else -> error("unreachable")
+                }
+                out += TxOp(
+                    phase = TxPhase.NEURONAL,
+                    opcode = opcode,
+                    dst = op.dst,
+                    dstSpace = SPACE_NEURON,
+                    a = op.a.toTxOperand(),
+                    b = op.b.toTxOperand()
+                )
+            }
+
+            NeuronOpCode.CMP_GE -> {
+                out += TxOp(
+                    phase = TxPhase.NEURONAL,
+                    opcode = TxOpcode.CMP_GE,
+                    dst = op.dst,                 // имя предикатного поля
+                    dstSpace = SPACE_NEURON,
+                    a = op.a.toTxOperand(),
+                    b = op.b.toTxOperand()
+                )
+            }
+
+            NeuronOpCode.EMIT -> {
+                out += TxOp(
+                    phase = TxPhase.NEURONAL,
+                    opcode = TxOpcode.EMIT,
+                    dst = op.dst,                 // "spike_out" или поле для сброса
+                    dstSpace = SPACE_NEURON,
+                    a = op.a.toTxOperand(),       // предикат-поле
+                    b = op.b.toTxOperand()        // imm(0) или imm(reset)
+                )
+            }
+
+            NeuronOpCode.EMIT_IF -> {
+                out += TxOp(
+                    phase = TxPhase.NEURONAL,
+                    opcode = TxOpcode.EMIT_IF,
+                    dst = op.dst,                 // логическое имя выхода (обычно "spike_out")
+                    dstSpace = SPACE_NEURON,
+                    a = op.a.toTxOperand(),       // левый операнд сравнения
+                    b = op.b.toTxOperand(),       // правый операнд сравнения
+                    cmp = op.cmp,                 // GT/LT/GE/LE
+                    resetDst = op.resetDst,
+                    resetImm = op.resetImm
+                )
+            }
+        }
+    }
+    return out
+}
+
+// ===== Сборка общего IR =====
+fun buildTxIR(spike: SpikeTx, neuron: NeuronTx): TxIR {
+    val ir = TxIR()
+    ir.ops += spike.toIR()
+    ir.ops += neuron.toIR()
+    return ir
+}
+
+// Текстовый дамп (читабельно для отладки/репортов)
+fun TxIR.dump() {
+    println("==== TxIR dump ====")
+    for ((i, op) in ops.withIndex()) {
+        val aStr = op.a?.let { if (it.isImm) "#${it.imm}" else "${it.space}.${it.name}" } ?: "-"
+        val bStr = op.b?.let { if (it.isImm) "#${it.imm}" else "${it.space}.${it.name}" } ?: "-"
+        when (op.opcode) {
+            TxOpcode.EMIT_IF -> {
+                val cmpStr = when (op.cmp) {
+                    NeuronCmp.GT -> ">"
+                    NeuronCmp.LT -> "<"
+                    NeuronCmp.GE -> ">="
+                    NeuronCmp.LE -> "<="
+                    else -> "?"
+                }
+                val rst = if (op.resetDst != null && op.resetImm != null)
+                    " reset ${op.resetDst}:=${op.resetImm}" else ""
+                println("[%02d] %-9s %-8s dst=%s.%s  if (%s %s %s)%s"
+                    .format(i, op.phase, op.opcode, op.dstSpace, op.dst, aStr, cmpStr, bStr, rst))
+            }
+            else -> {
+                println("[%02d] %-9s %-9s dst=%s.%s  a=%s  b=%s"
+                    .format(i, op.phase, op.opcode, op.dstSpace, op.dst, aStr, bStr))
+            }
+        }
+    }
+}
+
+// JSON (минимально, через org.json уже у тебя подключён)
+fun TxIR.toJson(): org.json.JSONObject {
+    val root = org.json.JSONObject()
+    val arr = org.json.JSONArray()
+    for (op in ops) {
+        val jo = org.json.JSONObject()
+        jo.put("phase", op.phase.name)
+        jo.put("opcode", op.opcode.name)
+        jo.put("dst", op.dst)
+        jo.put("dstSpace", op.dstSpace)
+
+        fun enc(o: TxOperand?): org.json.JSONObject? {
+            if (o == null) return null
+            val x = org.json.JSONObject()
+            x.put("isImm", o.isImm)
+            if (o.isImm) x.put("imm", o.imm) else {
+                x.put("name", o.name)
+                x.put("space", o.space)
+            }
+            return x
+        }
+
+        enc(op.a)?.let { jo.put("a", it) }
+        enc(op.b)?.let { jo.put("b", it) }
+
+        op.cmp?.let { jo.put("cmp", it.name) }
+        op.resetDst?.let { jo.put("resetDst", it) }
+        op.resetImm?.let { jo.put("resetImm", it) }
+
+        arr.put(jo)
+    }
+    root.put("ops", arr)
+    return root
+}
+
+fun AstModule.dump() {
+    println("==== AST: $name ====")
+    for (blk in blocks) {
+        println("-- phase: ${blk.phase} --")
+        for ((i, s) in blk.stmts.withIndex()) {
+            fun e(e: AstExpr): String = when (e) {
+                is AstExpr.Imm -> "#${e.value}"
+                is AstExpr.FieldRef -> "${e.space}.${e.name}"
+                is AstExpr.Bin -> "(${e(e.a)} ${e.op} ${e(e.b)})"
+                is AstExpr.Cmp -> "(${e(e.a)} ${e.op} ${e(e.b)})"
+            }
+            when (s) {
+                is AstStmt.Assign ->
+                    println("[%02d] %s := %s".format(i, e(s.dst), e(s.expr)))
+                is AstStmt.ExternalAssign ->
+                    println("[%02d] %s := %s   // external".format(i, e(s.dst), e(s.expr)))
+                is AstStmt.DelayAssign ->
+                    println("[%02d] %s := %s   // delay".format(i, e(s.dst), e(s.expr)))
+                is AstStmt.EmitIf -> {
+                    val rst = if (s.resetDst != null && s.resetImm != null)
+                        " reset ${e(s.resetDst)} := #${s.resetImm}" else ""
+                    println("[%02d] EMIT_IF cond=%s out=%s%s"
+                        .format(i, e(s.cond), s.outName, rst))
+                }
+            }
+        }
+    }
+}
+
+
+// ===== AST: выражения =====
+sealed class AstExpr {
+    data class Imm(val value: Int) : AstExpr()
+    data class FieldRef(val space: String, val name: String) : AstExpr()   // space: "SPIKE"/"NEURON"
+    data class Bin(val op: BinOp, val a: AstExpr, val b: AstExpr) : AstExpr()
+    data class Cmp(val op: CmpOp, val a: AstExpr, val b: AstExpr) : AstExpr()
+}
+
+enum class BinOp { ADD, SUB, SHL, SHR }
+enum class CmpOp { GT, GE, LT, LE, EQ, NE }
+
+// ===== AST: операторы/инструкции =====
+sealed class AstStmt {
+    // Присваивание в локальное поле (SPIKE)
+    data class Assign(val dst: AstExpr.FieldRef, val expr: AstExpr) : AstStmt()
+
+    // Присваивание во внешнее поле (обычно NEURON) из спайковой фазы
+    data class ExternalAssign(val dst: AstExpr.FieldRef, val expr: AstExpr) : AstStmt()
+
+    // Операции с задержкой (локальные DELAY-поля)
+    data class DelayAssign(val dst: AstExpr.FieldRef, val expr: AstExpr) : AstStmt()
+
+    // Эмиссия с условием, с опциональным сбросом
+    data class EmitIf(
+        val cond: AstExpr.Cmp,
+        val outName: String = "spike_out",
+        val resetDst: AstExpr.FieldRef? = null,
+        val resetImm: Int? = null
+    ) : AstStmt()
+}
+
+// ===== AST: блоки и корень =====
+enum class AstPhase { SYNAPTIC, NEURONAL }
+
+data class AstBlock(val phase: AstPhase, val stmts: MutableList<AstStmt> = mutableListOf())
+
+data class AstModule(
+    val name: String = "tx_module",
+    val blocks: MutableList<AstBlock> = mutableListOf(
+        AstBlock(AstPhase.SYNAPTIC),
+        AstBlock(AstPhase.NEURONAL)
+    )
+) {
+    fun syn(): AstBlock = blocks.first { it.phase == AstPhase.SYNAPTIC }
+    fun neu(): AstBlock = blocks.first { it.phase == AstPhase.NEURONAL }
+}
+
+
+// Утилиты для упаковки операндов в AstExpr
+private fun spikeOpndToExpr(o: SpikeOperand): AstExpr =
+    if (o.isImm) AstExpr.Imm(o.imm)
+    else AstExpr.FieldRef(
+        space = if (o.isExternal) (o.extSpace ?: "SPIKE") else "SPIKE",
+        name = o.fieldName ?: error("SpikeOperand.fieldName == null")
+    )
+
+private fun neuronOpndToExpr(o: NeuronOperand): AstExpr =
+    if (o.isImm) AstExpr.Imm(o.imm)
+    else AstExpr.FieldRef(space = "NEURON", name = o.fieldName ?: error("NeuronOperand.fieldName == null"))
+
+private fun spikeOpToBin(op: SpikeOpCode): BinOp = when (op) {
+    SpikeOpCode.ADD -> BinOp.ADD
+    SpikeOpCode.SUB -> BinOp.SUB
+    SpikeOpCode.SHL -> BinOp.SHL
+    SpikeOpCode.SHR -> BinOp.SHR
+}
+private fun neuronOpToBin(op: NeuronOpCode): BinOp = when (op) {
+    NeuronOpCode.ADD -> BinOp.ADD
+    NeuronOpCode.SUB -> BinOp.SUB
+    NeuronOpCode.SHL -> BinOp.SHL
+    NeuronOpCode.SHR -> BinOp.SHR
+    else -> error("not a binary op: $op")
+}
+
+// Собираем AST из SpikeTx (в синоптический блок)
+fun SpikeTx.toAst(module: AstModule) {
+    val syn = module.syn()
+    for (op in listOps()) {
+        val a = spikeOpndToExpr(op.a)
+        val b = spikeOpndToExpr(op.b)
+
+        val bin = AstExpr.Bin(spikeOpToBin(op.opcode), a, b)
+
+        val dstRef = AstExpr.FieldRef(
+            space = if (op.dstIsExternal) (op.dstExtSpace ?: "NEURON") else "SPIKE",
+            name = op.dst
+        )
+
+        // логика твоей постановки:
+        // — если пишем во внешний нейрон — ExternalAssign;
+        // — если dst — локальный DELAY → DelayAssign (мидлварь уже проверяет тип);
+        // — иначе обычное Assign.
+        if (op.dstIsExternal) {
+            syn.stmts += AstStmt.ExternalAssign(dstRef, bin)
+        } else {
+            // здесь можно проверить, что это delay-поле (если хочется жестко валидировать)
+            syn.stmts += AstStmt.DelayAssign(dstRef, bin)
+        }
+    }
+}
+
+// Собираем AST из NeuronTx (в нейронный блок)
+fun NeuronTx.toAst(module: AstModule) {
+    val neu = module.neu()
+    for (op in listOps()) {
+        when (op.opcode) {
+            NeuronOpCode.ADD, NeuronOpCode.SUB, NeuronOpCode.SHL, NeuronOpCode.SHR -> {
+                val a = neuronOpndToExpr(op.a)
+                val b = neuronOpndToExpr(op.b)
+                val bin = AstExpr.Bin(neuronOpToBin(op.opcode), a, b)
+                val dst = AstExpr.FieldRef("NEURON", op.dst)
+                neu.stmts += AstStmt.Assign(dst, bin)
+            }
+
+            NeuronOpCode.CMP_GE -> {
+                val a = neuronOpndToExpr(op.a)
+                val b = neuronOpndToExpr(op.b)
+                val cmp = AstExpr.Cmp(CmpOp.GE, a, b)
+                // сохраняем как Assign в предикат — это тоже нормальный AST-узел:
+                val dst = AstExpr.FieldRef("NEURON", op.dst)
+                neu.stmts += AstStmt.Assign(dst, cmp) // потребитель (emit) может прочитать предикат из поля
+            }
+
+            NeuronOpCode.EMIT -> {
+                // интерпретация из твоего соглашения:
+                //  a = предикат-поле (NeuronOperand.field)
+                //  dst = "spike_out" (без сброса) ИЛИ имя поля для сброса
+                //  b = imm(0) или imm(reset)
+                val pred = AstExpr.FieldRef("NEURON", op.a.fieldName ?: error("emit predicate name null"))
+                val zeroOrReset = neuronOpndToExpr(op.b)
+                val cond = AstExpr.Cmp(CmpOp.NE, pred, AstExpr.Imm(0))  // предикат ≠ 0
+
+                val (resetDst, resetImm) =
+                    if (op.dst == "spike_out") null to null
+                    else AstExpr.FieldRef("NEURON", op.dst) to (zeroOrReset as? AstExpr.Imm)?.value
+
+                neu.stmts += AstStmt.EmitIf(
+                    cond = cond,
+                    outName = "spike_out",
+                    resetDst = resetDst,
+                    resetImm = resetImm
+                )
+            }
+
+            NeuronOpCode.EMIT_IF -> {
+                // если позже добавишь «атомарный» emit-if
+                val a = neuronOpndToExpr(op.a)
+                val b = neuronOpndToExpr(op.b)
+                val cmpOp = when (op.cmp) {
+                    NeuronCmp.GT -> CmpOp.GT
+                    NeuronCmp.GE -> CmpOp.GE
+                    NeuronCmp.LT -> CmpOp.LT
+                    NeuronCmp.LE -> CmpOp.LE
+                    NeuronCmp.EQ -> CmpOp.EQ
+                    NeuronCmp.NE -> CmpOp.NE
+                    else -> CmpOp.GE
+                }
+                val cond = AstExpr.Cmp(cmpOp, a, b)
+                val resetDst = op.resetDst?.let { AstExpr.FieldRef("NEURON", it) }
+                neu.stmts += AstStmt.EmitIf(
+                    cond = cond,
+                    outName = op.dst,
+                    resetDst = resetDst,
+                    resetImm = op.resetImm
+                )
+            }
+        }
+    }
+}
+
+// Построение единого AST (корня)
+fun buildAst(spike: SpikeTx, neuron: NeuronTx, name: String = "lif_module"): AstModule {
+    val m = AstModule(name)
+    spike.toAst(m)
+    neuron.toAst(m)
+    return m
+}
+
+
+
+
+
+
+
+fun main() {
+    // ---------- 1) Спайковая транзакция ----------
+    val spike = SpikeTx()
+    spike.addField("w",     16, SpikeFieldKind.SYNAPTIC_PARAM) // вес
+    spike.addField("delay", 8,  SpikeFieldKind.DELAY)          // задержка
+    spike.addField("tag",   8,  SpikeFieldKind.SYNAPTIC_PARAM) // метка/тег
+
+
+    spike.opAddExt(
+        dstNeuronName = "Vmemb",
+        a = SpikeOperand.neuronField("Vmemb"),
+        b = SpikeOperand.field("w")
+    )
+
+
+    // пример использования нейронного поля внутри SpikeTx:
+    // acc = acc + neuron.gain   (нейронное поле — внешний операнд)
+    // (если в нейроне будет поле "gain")
+    // spike.opAdd(
+    //     dst = "acc",
+    //     a   = SpikeOperand.field("acc"),
+    //     b   = SpikeOperand.neuronField("gain")
+    // )
+
+    // ---------- 2) Нейронная транзакция ----------
+    val neuron = NeuronTx()
+    neuron.addField("Vmemb", 16, NeuronFieldKind.DYNAMIC)         // мембранный потенциал
+    neuron.addField("Vthr",  16, NeuronFieldKind.STATIC)          // порог
+    neuron.addField("Vrst",  16, NeuronFieldKind.STATIC)          // значение сброса (если нужно как поле)
+
+    // --- G: интеграция веса (пример: Vmemb = Vmemb + w) ---
+//    neuron.opAdd(dst = "Vmemb", aField = "Vmemb", bField = "w")   // w — из SpikeTx → мидлварь смэпит источник
+
+// --- F_dyn: утечка ---
+    neuron.opShrImm(dst = "Vmemb", aField = "Vmemb", shift = 1)
+
+// условие: if (Vmemb >= Vthr)
+    val cond = neuron.ifGe("Vmemb", "Vthr")
+
+// emit(if cond) + сброс Vmemb := 0
+    neuron.opEmitIf(cond, resetDst = "Vmemb", resetImm = 0)
+// или без сброса: neuron.opEmitIf(cond)
+
+    // ---------- 3) Отладочный вывод ----------
+    println("== Spike fields ==")
+    for (f in spike.listFieldsSnapshot()) {
+        println("  ${f.name} : width=${f.width}, kind=${f.kind}")
+    }
+    println("== Spike ops ==")
+    spike.dumpOps()
+
+    println("== Neuron fields ==")
+    neuron.listFields()
+    println("== Neuron ops ==")
+    neuron.dumpOps()
+
+    // 4. Построить IR и вывести
+    val ir = buildTxIR(spike, neuron)
+    ir.dump()
+
+// (опционально) JSON
+    val json = ir.toJson()
+    println(json.toString(2))   // красивый отступ 2
+
+    // 4) Построить AST и напечатать
+    val ast = buildAst(spike, neuron, name = "lif_ast")
+    ast.dump()
+
+}
+
+
+
+
 
 class TickGenerator {
     fun tick_generation(
@@ -64,751 +1166,12 @@ class TickGenerator {
     }
 }
 
-
-
-
-
-data class InternalSpikeBufferCounters(
-    val rdCounter: hw_var,
-    val wrCounter: hw_var,
-    val w_data_if: hw_var,
-    val wr_if: hw_var,
-    val r_data_if: hw_var,
-    val rd_if: hw_var
-)
-
-data class QueueIF(
-    val rdCounter: hw_var,
-    val wrCounter: hw_var,
-    val r_data_if: hw_var,
-    val rd_if: hw_var,
-
-    val wr_data_i: hw_var,
-    val full_o: hw_var,
-//    val wr_counter: hw_var,
-    val we_i: hw_var,
-//    val rst: hw_var,
-    val empty_o: hw_var
-)
-
-
-//data class InputQueueCounters(
-//    val rdCounter: hw_var,
-//    val wrCounter: hw_var,
-//    val r_data_if: hw_var,
-//    val rd_if: hw_var,
-//
-//    val wr_data_i: hw_var,
-//    val full_o: hw_var,
-////    val wr_counter: hw_var,
-//    val we_i: hw_var,
-//    val rst: hw_var,
-//    val empty_o: hw_var
-//)
-
-//data class OutputQueueCounters(
-//    val wrCounter: hw_var,
-//    val rdCounter: hw_var,
-//    val w_data_if: hw_var,
-//    val we_i: hw_var,
-//
-//    val r_data_if: hw_var,
-//    val rd_if: hw_var,
-//    val full_o: hw_var,
-//    val empty_o: hw_var,
-//    val rst: hw_var
-//
-//)
-
-
-class Queues {
-    internal fun input_queue_generation_credit_counter(
-        name: String,
-        data_width: Int,
-        pointer_width: Int,
-        depth: Int,
-        tick: hw_var,
-        cyclix_gen: Generic
-    ): QueueIF {
-
-            // Initialize interface signals as globals
-        val rd = cyclix_gen.uglobal("rd_" + name, hw_dim_static(1), "0")
-        val rd_data = cyclix_gen.uglobal("rd_data_"+name, hw_dim_static(data_width), "0")
-
-        val wr = cyclix_gen.uport("wr_"+name, PORT_DIR.IN, hw_dim_static(1), "0")
-        val wr_r = cyclix_gen.uglobal("wr_r_"+name, hw_dim_static(1), "0")
-        wr_r.assign(wr)
-
-        val wr_data = cyclix_gen.uport("wr_data_"+name, PORT_DIR.IN, hw_dim_static(data_width), "0")
-        val wr_data_r = cyclix_gen.uglobal("wr_data_r_"+name, hw_dim_static(data_width), "0")
-        wr_data_r.assign(wr_data)
-
-        val wr_credit = cyclix_gen.uglobal("wr_credit_"+name, hw_dim_static(8), "0")
-        val rd_credit = cyclix_gen.ulocal("rd_credit_"+name, hw_dim_static(8), "0")
-
-        val full = cyclix_gen.uport("full_"+name, PORT_DIR.OUT, hw_dim_static(1), "0")
-        val full_reg = cyclix_gen.uglobal("full_reg_"+name, hw_dim_static(1), "0")
-        full.assign(full_reg)
-
-        val array_reg_dim = hw_dim_static(data_width)
-        array_reg_dim.add(depth, 0)
-        var array_reg = cyclix_gen.uglobal("array_reg_"+name, array_reg_dim, "0")
-
-        val w_ptr_reg = cyclix_gen.uglobal("w_ptr_reg_"+name, hw_dim_static(data_width-1), "0")
-        val w_ptr_next = cyclix_gen.uglobal("w_ptr_next_"+name, hw_dim_static(data_width-1), "0")
-        val w_ptr_succ = cyclix_gen.uglobal("w_ptr_succ_"+name, hw_dim_static(data_width-1), "0")
-
-        val r_ptr_reg = cyclix_gen.uglobal("r_ptr_reg_"+name, hw_dim_static(data_width-1), "0")
-        val r_ptr_next = cyclix_gen.uglobal("r_ptr_next_"+name, hw_dim_static(data_width-1), "0")
-        val r_ptr_succ = cyclix_gen.uglobal("r_ptr_succ_"+name, hw_dim_static(data_width-1), "0")
-
-        val empty = cyclix_gen.uglobal("empty_"+name, hw_dim_static(1), "1")
-        val full_next = cyclix_gen.uglobal("full_next_"+name, hw_dim_static(1), "0")
-        val empty_next = cyclix_gen.uglobal("empty_next_"+name, hw_dim_static(1), "1")
-
-        val wr_en = cyclix_gen.uglobal("wr_en_"+name, hw_dim_static(1), "0")
-
-        val credit_counter_dim = hw_dim_static(8)
-        credit_counter_dim.add(1,0)
-        val credit_counter = cyclix_gen.uglobal("credit_counter_"+name, credit_counter_dim, "0")
-
-        val act_counter = cyclix_gen.uglobal("act_counter_"+name, hw_dim_static(0, 0), "0")
-
-        cyclix_gen.begif(cyclix_gen.eq2(tick, 1))
-        run{
-            act_counter.assign(cyclix_gen.bnot(act_counter))
-        }; cyclix_gen.endif()
-
-
-        cyclix_gen.begif(cyclix_gen.eq2(wr_en, 1))
-        run{
-            array_reg[w_ptr_reg].assign(wr_data_r)
-            credit_counter[act_counter].assign(credit_counter[act_counter].plus(1))
-        }; cyclix_gen.endif()
-
-        wr_credit.assign(credit_counter[act_counter])
-        rd_credit.assign(credit_counter[cyclix_gen.bnot(act_counter)])
-
-        rd_data.assign(array_reg[r_ptr_reg])
-
-        wr_en.assign(cyclix_gen.land(wr_r, cyclix_gen.bnot(full_reg)))
-
-        w_ptr_reg.assign(w_ptr_next)
-        empty.assign(empty_next)
-        full_reg.assign(full_next)
-        r_ptr_reg.assign(r_ptr_next)
-
-
-        cyclix_gen.begcase(cyclix_gen.cnct(wr_r, rd))
-        run{
-            cyclix_gen.begbranch(1)  // 2'b01
-            run {
-                cyclix_gen.begif(cyclix_gen.bnot(empty))
-                run {
-                    r_ptr_next.assign(r_ptr_reg.plus(1))
-                    full_next.assign(0)
-
-                    cyclix_gen.begif(cyclix_gen.gr(credit_counter[cyclix_gen.bnot(act_counter)], 0))
-                    run {
-                        credit_counter[cyclix_gen.bnot(act_counter)].assign(credit_counter[cyclix_gen.bnot(act_counter)].minus(1))
-                    }; cyclix_gen.endif()
-                    cyclix_gen.begelse()  // Saturation
-                    run {
-                        credit_counter[cyclix_gen.bnot(act_counter)].assign(0)  // если счетчик пуст -- кредитов ноль
-                    };cyclix_gen.endif()
-
-                    cyclix_gen.begif(cyclix_gen.eq2(r_ptr_reg.plus(1), w_ptr_reg))
-                    run {
-                        empty_next.assign(1)
-                    }; cyclix_gen.endif()
-                }; cyclix_gen.endif()
-                cyclix_gen.begelse()
-                run {
-                    credit_counter[cyclix_gen.bnot(act_counter)].assign(0)  // если счетчик пуст -- кредитов ноль
-                };cyclix_gen.endif()
-
-
-            }; cyclix_gen.endbranch()
-
-            cyclix_gen.begbranch(2)  // 2'b10
-            run {
-                cyclix_gen.begif(cyclix_gen.bnot(full_reg))
-                run {
-                    w_ptr_next.assign(w_ptr_reg.plus(1))
-                    empty_next.assign(0)
-                    cyclix_gen.begif(cyclix_gen.eq2(w_ptr_reg.plus(1), r_ptr_reg))
-                    run {
-                        full_next.assign(1)
-                    }; cyclix_gen.endif()
-                }; cyclix_gen.endif()
-            }; cyclix_gen.endbranch()
-
-            cyclix_gen.begbranch(3)  // 2'b11
-            run {
-                w_ptr_next.assign(w_ptr_reg.plus(1))
-                r_ptr_next.assign(r_ptr_reg.plus(1))
-
-                cyclix_gen.begif(cyclix_gen.gr(credit_counter[cyclix_gen.bnot(act_counter)], 0))
-                run {
-                    credit_counter[cyclix_gen.bnot(act_counter)].assign(credit_counter[cyclix_gen.bnot(act_counter)].minus(1))
-                }; cyclix_gen.endif()
-                cyclix_gen.begelse()  // Saturation
-                run {
-                    credit_counter[cyclix_gen.bnot(act_counter)].assign(0)  // если счетчик пуст -- кредитов ноль
-                };cyclix_gen.endif()
-
-//                credit_counter[cyclix_gen.bnot(act_counter)].assign(credit_counter[cyclix_gen.bnot(act_counter)].minus(1))
-
-            }; cyclix_gen.endbranch()
-        }; cyclix_gen.endcase()
-
-        return QueueIF(
-            rdCounter = rd_credit,
-            wrCounter = wr_credit,
-            r_data_if = rd_data,
-            rd_if = rd,
-            wr_data_i = wr_data_r,
-            full_o = full_reg,
-            we_i = wr_r,
-            empty_o = empty
-        )
-    }
-
-
-    fun output_queue_generation_credit_counter(
-        name: String,
-        data_width: Int,
-        pointer_width: Int,
-        depth: Int,
-        tick: hw_var,
-        cyclix_gen: Generic
-    ): QueueIF {
-        // Внешний сигнал
-        val wr = cyclix_gen.uglobal("wr_"+name, hw_dim_static(1), "0")
-        val wr_data = cyclix_gen.uglobal("wr_data_" + name, hw_dim_static(data_width), "0")
-
-        val rd = cyclix_gen.uport("rd_"+name, PORT_DIR.IN, hw_dim_static(1), "0")
-        val rd_r = cyclix_gen.uglobal("rd_r_"+name, hw_dim_static(1), "0")
-        rd_r.assign(rd)
-
-        val rd_data = cyclix_gen.uport("rd_data_"+name, PORT_DIR.OUT, hw_dim_static(data_width), "0")
-        val rd_data_r = cyclix_gen.uglobal("rd_data_r_"+name, hw_dim_static(data_width), "0")
-        rd_data.assign(rd_data_r)
-
-        val wr_credit = cyclix_gen.uglobal("wr_credit_"+name, hw_dim_static(8), "0")
-        val rd_credit = cyclix_gen.ulocal("rd_credit_"+name, hw_dim_static(8), "0")
-
-        val empty = cyclix_gen.uport("empty_"+name, PORT_DIR.OUT, hw_dim_static(1), "0")
-        val empty_r = cyclix_gen.uglobal("empty_r_"+name, hw_dim_static(1), "0")
-        empty.assign(empty_r)
-
-        val array_reg_dim = hw_dim_static(data_width)
-        array_reg_dim.add(depth, 0)
-        var array_reg = cyclix_gen.uglobal("array_reg_"+name, array_reg_dim, "0")
-
-        val w_ptr_reg = cyclix_gen.uglobal("w_ptr_reg_"+name, hw_dim_static(data_width-1), "0")
-        val w_ptr_next = cyclix_gen.uglobal("w_ptr_next_"+name, hw_dim_static(data_width-1), "0")
-        val w_ptr_succ = cyclix_gen.uglobal("w_ptr_succ_"+name, hw_dim_static(data_width-1), "0")
-
-        val r_ptr_reg = cyclix_gen.uglobal("r_ptr_reg_"+name, hw_dim_static(data_width-1), "0")
-        val r_ptr_next = cyclix_gen.uglobal("r_ptr_next_"+name, hw_dim_static(data_width-1), "0")
-        val r_ptr_succ = cyclix_gen.uglobal("r_ptr_succ_"+name, hw_dim_static(data_width-1), "0")
-
-        val full_reg = cyclix_gen.uglobal("full_reg_"+name, hw_dim_static(1), "0")
-        val empty_reg = cyclix_gen.uglobal("empty_reg_"+name, hw_dim_static(1), "1")
-        val full_next = cyclix_gen.uglobal("full_next_"+name, hw_dim_static(1), "0")
-        val empty_next = cyclix_gen.uglobal("empty_next_"+name, hw_dim_static(1), "0")
-
-        val wr_en = cyclix_gen.uglobal("wr_en_"+name, hw_dim_static(1), "0")
-
-        // Инициализируем счетчики выходной очереди внутри метода:
-        val queue_wr_output_counter = cyclix_gen.uglobal("queue_wr_output_counter_"+name, hw_dim_static(8), "0")
-        val queue_rd_output_counter = cyclix_gen.uglobal("queue_rd_output_counter_"+name, hw_dim_static(8), "0")
-
-        queue_rd_output_counter.assign(rd_credit)
-        queue_wr_output_counter.assign(wr_credit)
-
-        val credit_counter_dim = hw_dim_static(8)
-        credit_counter_dim.add(1,0)
-        val credit_counter = cyclix_gen.uglobal("credit_counter_"+name, credit_counter_dim, "0")
-
-        val act_counter = cyclix_gen.uglobal("act_counter"+name, hw_dim_static(0, 0), "0")
-
-        cyclix_gen.begif(cyclix_gen.eq2(tick, 1))
-        run{
-            act_counter.assign(cyclix_gen.bnot(act_counter))
-        }; cyclix_gen.endif()
-
-
-        cyclix_gen.begif(cyclix_gen.eq2(wr_en, 1))
-        run{
-            array_reg[w_ptr_reg].assign(wr_data)
-            credit_counter[act_counter].assign(credit_counter[act_counter].plus(1))
-        }; cyclix_gen.endif()
-
-        wr_credit.assign(credit_counter[act_counter])
-        rd_credit.assign(credit_counter[cyclix_gen.bnot(act_counter)])
-
-        rd_data_r.assign(array_reg[r_ptr_reg])
-
-        wr_en.assign(cyclix_gen.land(wr, cyclix_gen.bnot(full_reg)))
-
-
-            w_ptr_reg.assign(w_ptr_next)
-            r_ptr_reg.assign(r_ptr_next)
-            full_reg.assign(full_next)
-            empty_reg.assign(empty_next)
-
-
-        w_ptr_succ.assign(w_ptr_reg.plus(1))
-        r_ptr_succ.assign(r_ptr_reg.plus(1))
-        w_ptr_next.assign(w_ptr_reg)
-        r_ptr_next.assign(r_ptr_reg)
-        full_next.assign(full_reg)
-        empty_next.assign(empty_reg)
-
-        cyclix_gen.begcase(cyclix_gen.cnct(wr, rd_r))
-        run{
-            cyclix_gen.begbranch(1)  // 2'b01
-            run {
-                cyclix_gen.begif(cyclix_gen.bnot(empty_reg))
-                run{
-                    r_ptr_next.assign(r_ptr_succ)
-                    full_next.assign(0)
-
-                    credit_counter[cyclix_gen.bnot(act_counter)].assign(credit_counter[cyclix_gen.bnot(act_counter)].minus(1))
-
-                    cyclix_gen.begif(cyclix_gen.eq2(r_ptr_succ, w_ptr_reg))
-                    run{
-                        empty_next.assign(1)
-                    }; cyclix_gen.endif()
-                }; cyclix_gen.endif()
-            }; cyclix_gen.endbranch()
-
-            cyclix_gen.begbranch(2)  // 2'b10
-            run {
-                cyclix_gen.begif(cyclix_gen.bnot(full_reg))
-                run{
-                    w_ptr_next.assign(w_ptr_succ)
-                    empty_next.assign(0)
-                    cyclix_gen.begif(cyclix_gen.eq2(w_ptr_succ, r_ptr_reg))
-                    run{
-                        full_next.assign(1)
-                    }; cyclix_gen.endif()
-                }; cyclix_gen.endif()
-
-                cyclix_gen.begelse()
-                run{
-                    credit_counter[cyclix_gen.bnot(act_counter)].assign(0)  // если счетчик пуст -- кредитов ноль
-
-                };cyclix_gen.endif()
-
-            }; cyclix_gen.endbranch()
-
-            cyclix_gen.begbranch(3)  // 2'b11
-            run {
-                w_ptr_next.assign(w_ptr_succ)
-                r_ptr_next.assign(r_ptr_succ)
-            }; cyclix_gen.endbranch()
-        }; cyclix_gen.endcase()
-
-        empty_r.assign(empty_reg)
-
-
-        return QueueIF(
-            rdCounter=rd_credit,
-            wrCounter=wr_credit,
-            r_data_if=rd_data_r,
-            rd_if=rd_r,
-            wr_data_i=wr_data,
-            full_o=full_reg,
-            we_i=wr,
-            empty_o=empty_r
-        )
-    }
-
-    internal fun internal_spike_buffer_generation_credit_counter(
-        name: String,
-        data_width: Int,
-        pointer_width: Int,
-        depth: Int,
-        tick: hw_var,
-
-        cyclix_gen: Generic
-    ): QueueIF {
-
-        val rd_r = cyclix_gen.uglobal("rd_"+name, hw_dim_static(1), "0")
-        val wr_r = cyclix_gen.uglobal("wr_"+name, hw_dim_static(1), "0")
-        val wr_data = cyclix_gen.uglobal("wr_data_"+name, hw_dim_static(data_width), "0")
-
-        val rd_data = cyclix_gen.uglobal("rd_data_" + name, hw_dim_static(data_width), "0")
-
-
-
-        val rd_counter = cyclix_gen.uglobal("internal_rd_counter_" + name, hw_dim_static(8), "0")
-        val wr_counter = cyclix_gen.uglobal("internal_wr_counter_" + name, hw_dim_static(8), "0")
-
-
-//        val empty = cyclix_gen.uglobal("empty_"+name, hw_dim_static(1), "0")
-
-//        val full = cyclix_gen.uglobal("full_"+name, hw_dim_static(1), "0")
-
-
-//        val r_data = cyclix_gen.uglobal("r_data_"+name, hw_dim_static(data_width), "0")
-
-        val array_reg_dim = hw_dim_static(data_width)
-        array_reg_dim.add(depth, 0)
-        var array_reg = cyclix_gen.uglobal("array_reg_"+name, array_reg_dim, "0")
-
-        val w_ptr_reg = cyclix_gen.uglobal("w_ptr_reg_"+name, hw_dim_static(data_width-1), "0")
-        val w_ptr_next = cyclix_gen.uglobal("w_ptr_next_"+name, hw_dim_static(data_width-1), "0")
-        val w_ptr_succ = cyclix_gen.uglobal("w_ptr_succ_"+name, hw_dim_static(data_width-1), "0")
-
-        val r_ptr_reg = cyclix_gen.uglobal("r_ptr_reg_"+name, hw_dim_static(data_width-1), "0")
-        val r_ptr_next = cyclix_gen.uglobal("r_ptr_next_"+name, hw_dim_static(data_width-1), "0")
-        val r_ptr_succ = cyclix_gen.uglobal("r_ptr_succ_"+name, hw_dim_static(data_width-1), "0")
-
-        val full_reg = cyclix_gen.uglobal("full_reg_"+name, hw_dim_static(1), "0")
-        val empty_reg = cyclix_gen.uglobal("empty_reg_"+name, hw_dim_static(1), "1")
-        val full_next = cyclix_gen.uglobal("full_next_"+name, hw_dim_static(1), "0")
-        val empty_next = cyclix_gen.uglobal("empty_next_"+name, hw_dim_static(1), "0")
-
-        val wr_en = cyclix_gen.uglobal("wr_en_"+name, hw_dim_static(1), "0")
-
-        val credit_counter_dim = hw_dim_static(8)
-        credit_counter_dim.add(1,0)
-        val credit_counter = cyclix_gen.uglobal("credit_counter_"+name, credit_counter_dim, "0")
-
-        val act_counter = cyclix_gen.uglobal("act_counter_"+name, hw_dim_static(0, 0), "0")
-
-//        cyclix_gen.begif(cyclix_gen.eq2(reset_r, 1))
-//        run{
-//            act_counter.assign(0)
-//        }; cyclix_gen.endif()
-
-        cyclix_gen.begif(cyclix_gen.eq2(tick, 1))
-        run{
-            act_counter.assign(cyclix_gen.bnot(act_counter))
-        }; cyclix_gen.endif()
-
-        cyclix_gen.begif(cyclix_gen.eq2(wr_en, 1))
-        run{
-            array_reg[w_ptr_reg].assign(wr_data)
-            credit_counter[act_counter].assign(credit_counter[act_counter].plus(1))
-        }; cyclix_gen.endif()
-
-        wr_counter.assign(credit_counter[act_counter])
-        rd_counter.assign(credit_counter[cyclix_gen.bnot(act_counter)])
-
-        rd_data.assign(array_reg[r_ptr_reg])
-
-        wr_en.assign(cyclix_gen.land(wr_r, cyclix_gen.bnot(full_reg)))
-
-//        cyclix_gen.begif(cyclix_gen.eq2(reset_r, 1))
-//        run{
-//            w_ptr_reg.assign(0)
-//            r_ptr_reg.assign(0)
-//            full_reg.assign(0)
-//            empty_reg.assign(1)
-//        }; cyclix_gen.endif()
-//        cyclix_gen.begelse()
-//        run{
-            w_ptr_reg.assign(w_ptr_next)
-            r_ptr_reg.assign(r_ptr_next)
-            full_reg.assign(full_next)
-            empty_reg.assign(empty_next)
-//        }; cyclix_gen.endif()
-
-        w_ptr_succ.assign(w_ptr_reg.plus(1))
-        r_ptr_succ.assign(r_ptr_reg.plus(1))
-        w_ptr_next.assign(w_ptr_reg)
-        r_ptr_next.assign(r_ptr_reg)
-        full_next.assign(full_reg)
-        empty_next.assign(empty_reg)
-
-        cyclix_gen.begcase(cyclix_gen.cnct(wr_r, rd_r))
-        run{
-            cyclix_gen.begbranch(1)  // 2'b01
-            run {
-                cyclix_gen.begif(cyclix_gen.bnot(empty_reg))
-                run{
-                    r_ptr_next.assign(r_ptr_succ)
-                    full_next.assign(0)
-
-                    credit_counter[cyclix_gen.bnot(act_counter)].assign(credit_counter[cyclix_gen.bnot(act_counter)].minus(1))
-
-                    cyclix_gen.begif(cyclix_gen.eq2(r_ptr_succ, w_ptr_reg))
-                    run{
-                        empty_next.assign(1)
-                    }; cyclix_gen.endif()
-                }; cyclix_gen.endif()
-            }; cyclix_gen.endbranch()
-
-            cyclix_gen.begbranch(2)  // 2'b10
-            run {
-                cyclix_gen.begif(cyclix_gen.bnot(full_reg))
-                run{
-                    w_ptr_next.assign(w_ptr_succ)
-                    empty_next.assign(0)
-                    cyclix_gen.begif(cyclix_gen.eq2(w_ptr_succ, r_ptr_reg))
-                    run{
-                        full_next.assign(1)
-                    }; cyclix_gen.endif()
-                }; cyclix_gen.endif()
-            }; cyclix_gen.endbranch()
-
-            cyclix_gen.begbranch(3)  // 2'b10
-            run {
-                w_ptr_next.assign(w_ptr_succ)
-                r_ptr_next.assign(r_ptr_succ)
-            }; cyclix_gen.endbranch()
-        }; cyclix_gen.endcase()
-
-
-        return QueueIF(
-            rdCounter = rd_counter,
-            wrCounter = wr_counter,
-            r_data_if = rd_data,
-            rd_if = rd_r,
-            wr_data_i = wr_data,
-            full_o = full_reg,
-            we_i = wr_r,
-            empty_o = empty_reg
-        )
-
-    }
-}
-
-enum class STATIC_PARAMS_TYPES {
-    FF,
-    RAM,
-    DUAL_RAM
-}
-
-data class StaticParamsIf(
-    val type: STATIC_PARAMS_TYPES,
-    val ff: hw_var? = null,
-    val ram_adr: hw_var? = null,
-    val ram_dat_o: hw_var? = null
-) {
-    companion object {
-        fun fromFF(ff: hw_var): StaticParamsIf {
-            return StaticParamsIf(type = STATIC_PARAMS_TYPES.FF, ff = ff)
-        }
-
-        fun fromRAM(ramAdr: hw_var, ramDatO: hw_var): StaticParamsIf {
-            return StaticParamsIf(
-                type = STATIC_PARAMS_TYPES.RAM,
-                ram_adr = ramAdr,
-                ram_dat_o = ramDatO
-            )
-        }
-    }
-}
-
-
-class StaticParams(
-    val name: String,
-    val bitWidth: Int,
-    val presynNeurons: Int,
-    val postsynNeurons: Int,
-    val type: STATIC_PARAMS_TYPES
-) {
-    fun generate(cyclix_gen: Generic): StaticParamsIf {
-        if (type == STATIC_PARAMS_TYPES.FF) {
-            val memDim = hw_dim_static(bitWidth)
-            memDim.add(presynNeurons - 1, 0)
-            memDim.add(postsynNeurons - 1, 0)
-
-            val ffVar = cyclix_gen.sglobal(name, memDim, "0")
-            return StaticParamsIf.fromFF(ff = ffVar)
-
-        } else if (type == STATIC_PARAMS_TYPES.RAM) {
-            // создаём RAM переменные
-            val ramAdr = cyclix_gen.sglobal("${name}_adr", "0")
-            val ramDatO = cyclix_gen.sglobal("${name}_dat_o", "0")
-            return StaticParamsIf.fromRAM(ramAdr = ramAdr, ramDatO = ramDatO)
-        }
-
-        throw IllegalArgumentException("Unknown type: $type")
-    }
-}
-
-data class DynamicBufIF(
-    val buf_param_1: hw_var,
-    val buf_param_2: hw_var
-)
-
-class DynamicParam(
-    val name: String,
-    val bitWidth: Int,
-    val postsynNeurons: Int,
-) {
-    fun generate(cyclix_gen: Generic, tick: hw_var): DynamicBufIF {
-        val actual_buf_num = cyclix_gen.uglobal("actual_buf_num_"+name, hw_dim_static(0, 0), "0")
-
-        cyclix_gen.begif(cyclix_gen.eq2(tick, 1))
-        run{
-            actual_buf_num.assign(cyclix_gen.bnot(actual_buf_num))
-        }; cyclix_gen.endif()
-
-        val memDim_3d = hw_dim_static(bitWidth)
-        memDim_3d.add(1, 0)
-        memDim_3d.add(postsynNeurons - 1, 0)
-
-        val memDim_2d = hw_dim_static(bitWidth)
-        memDim_2d.add(postsynNeurons - 1, 0)
-
-        val dynamic_buffer_3d = cyclix_gen.uglobal(name+"_3d", memDim_3d, "0")
-//        val dynamic_buffer_2d_1 = cyclix_gen.uglobal(name+"_2d_1", memDim_2d, "0")
-//        dynamic_buffer_2d_1.assign(dynamic_buffer_3d[actual_buf_num])
-//        val dynamic_buffer_2d_2 = cyclix_gen.uglobal(name+"_2d_2", memDim_2d, "0")
-//        dynamic_buffer_2d_2.assign(dynamic_buffer_3d[cyclix_gen.bnot(actual_buf_num)])
-
-        return DynamicBufIF(
-            buf_param_1=dynamic_buffer_3d[actual_buf_num],
-            buf_param_2=dynamic_buffer_3d[cyclix_gen.bnot(actual_buf_num)]
-        )
-    }
-}
-
 enum class NEURAL_NETWORK_TYPE {
     SFNN, SCNN
 }
 
-val OP_SOMATIC_PHASE = hwast.hw_opcode("somatic_phase")
-val OP_SYNAPTIC_PHASE = hwast.hw_opcode("synaptic_phase")
-
-//val OP_SYN_ACC = hwast.hw_opcode("synaptic_acc")
-//
-//val OP_NEURONS_ACC = hwast.hw_opcode("neuronal_acc")
-//val OP_SYN_ASSIGN = hwast.hw_opcode("syn_assign")
-
-val OP_NEURON_MINUS = hwast.hw_opcode("neuron_minus")
-val OP_NEURON_RIGHT_SHIFT = hwast.hw_opcode("neuron_right_shift")
-val OP_NEURON_COMPARE = hwast.hw_opcode("neuron_compare")
-val OP_NEURON_HANDLER = hwast.hw_opcode("neuron_handler")
-val OP_EMISSION_SPK = hwast.hw_opcode("spike_emission")
 
 val OP_SYN_PLUS = hwast.hw_opcode("syn_plus")
-
-
-class neuro_local(name : String, vartype : hw_type, defimm : hw_imm)
-    : hw_var(name, vartype, defimm) {
-
-    constructor(name : String, vartype : hw_type, defval : String)
-            : this(name, vartype, hw_imm(defval))
-}
-
-class neuro_global(name : String, vartype : hw_type, defimm : hw_imm)
-    : hw_var(name, vartype, defimm) {
-
-    constructor(name : String, vartype : hw_type, defval : String)
-            : this(name, vartype, hw_imm(defval))
-}
-
-class hw_var_soma(name: String, vartype: hw_type, defimm: hw_imm) : hw_var(name, vartype, defimm) {
-    val op2Expressions = mutableListOf<hw_var>()
-    val op2Src0 = mutableListOf<hw_param>()
-    val op2Src1 = mutableListOf<Int>()
-
-    fun AddExpr_op2(opcode: hw_opcode, src0: hw_param, src1: Int): hw_var {
-        val newExpr = hw_var(name, DATA_TYPE.BV_UNSIGNED, 0, 0, "0")
-        op2Expressions.add(newExpr)
-        op2Src0.add(src0)
-        op2Src1.add(src1)
-
-        return newExpr
-    }
-
-    fun geq(src0: hw_var_soma, src1: Int): hw_var {
-        return AddExpr_op2(OP2_LOGICAL_GEQ, src0, src1)
-    }
-}
-
-open class hw_somatic_phase(val name: String, val neuromorphic: Neuromorphic): hw_exec(OP_SOMATIC_PHASE) {
-    // Внутренние списки для хранения операндов (destination и source)
-    val dst = mutableListOf<hw_var>()
-    val src = mutableListOf<Int>()
-    val operations = mutableListOf<hw_exec>()
-
-    fun srl(op1: hw_var, op2: Int) {
-        dst.add(op1)
-        src.add(op2)
-        val shiftOp = hw_exec(OP_NEURON_RIGHT_SHIFT)
-        operations.add(shiftOp)
-    }
-
-    fun single_spike() {
-        val spikeOp = hw_exec(OP_EMISSION_SPK)
-        operations.add(spikeOp)
-    }
-
-
-    fun begif(cond: hw_param) {
-
-        val new_expr = hw_exec(OP1_IF)
-
-        if (cond is hw_var) {
-            val genvar = hw_var("gen_var", DATA_TYPE.BV_UNSIGNED, 0, 0, "0")
-            new_expr.AddGenVar(genvar)
-//            assign_gen(genvar, cond)
-            new_expr.AddParam(genvar)
-//            last().priority_conditions.add(genvar)
-        }
-
-    }
-
-    fun begin() {
-        neuromorphic.begproc_soma(this)
-    }
-}
-
-open class hw_synaptic_phase(val name: String, val neuromorphic: Neuromorphic): hw_exec(OP_SYNAPTIC_PHASE) {
-    val dst = mutableListOf<hw_var>()
-    val src = mutableListOf<hw_var>()
-
-    val operations = mutableListOf<hw_exec>()
-
-    fun plus(membrane_potential: hw_var, weight: hw_var, nnType: NEURAL_NETWORK_TYPE) {
-        dst.add(membrane_potential)
-        src.add(weight)
-
-        val plusOp = when (nnType) {
-            NEURAL_NETWORK_TYPE.SFNN -> hw_exec(OP_SYN_PLUS)
-            NEURAL_NETWORK_TYPE.SCNN -> hw_exec(OP_SYN_PLUS)
-            else -> hw_exec(OP_SYN_PLUS)
-        }
-
-        operations.add(plusOp)
-    }
-
-    fun begin() {
-        neuromorphic.begproc_syna(this)
-    }
-}
-
-open class SynapticTr(val name: String) {
-    val fields = mutableListOf<hw_var>()
-
-    fun add_field(fieldName: String, width: Int): hw_var {
-//        val newField = cyclix_gen.uglobal("${name}_${fieldName}", hw_dim_static(width), "0")
-        val newField = hw_var("${name}_${fieldName}", DATA_TYPE.BV_UNSIGNED,  "0")
-        fields.add(newField)
-        return newField
-    }
-}
-
-class SomaticTr(val name: String) {
-    val fields = mutableListOf<hw_var_soma>()
-
-    fun add_field(fieldName: String, width: Int): hw_var_soma {
-//        val newField = cyclix_gen.uglobal("${name}_${fieldName}", hw_dim_static(width), "0")
-        val newField = hw_var_soma("${name}_${fieldName}", hw_type(DATA_TYPE.BV_UNSIGNED, "0"),  hw_imm("0"))
-        fields.add(newField)
-        return newField
-    }
-}
 
 open class SnnArch(
     var name: String = "Default Name",
@@ -847,664 +1210,7 @@ open class SnnArch(
 }
 
 open class Neuromorphic(val name : String, val NN_model_params: SnnArch) : hw_astc_stdif() {
-
-    var locals = ArrayList<neuro_local>()
-    var globals = ArrayList<neuro_global>()
-
-    private fun add_local(new_local: neuro_local) {
-        if (wrvars.containsKey(new_local.name)) ERROR("Naming conflict for local: " + new_local.name)
-        if (rdvars.containsKey(new_local.name)) ERROR("Naming conflict for local: " + new_local.name)
-
-        wrvars.put(new_local.name, new_local)
-        rdvars.put(new_local.name, new_local)
-        locals.add(new_local)
-        new_local.default_astc = this
-    }
-
-    private fun add_global(new_global: neuro_global) {
-        if (wrvars.containsKey(new_global.name)) ERROR("Naming conflict for global: " + new_global.name)
-        if (rdvars.containsKey(new_global.name)) ERROR("Naming conflict for global: " + new_global.name)
-
-        wrvars.put(new_global.name, new_global)
-        rdvars.put(new_global.name, new_global)
-        globals.add(new_global)
-        new_global.default_astc = this
-    }
-
-    fun local(name: String, vartype: hw_type, defimm: hw_imm): neuro_local {
-        var ret_var = neuro_local(name, vartype, defimm)
-        add_local(ret_var)
-        return ret_var
-    }
-
-    fun local(name: String, src_struct: hw_struct, dimensions: hw_dim_static): neuro_local {
-        var ret_var = neuro_local(name, hw_type(src_struct, dimensions), "0")
-        add_local(ret_var)
-        return ret_var
-    }
-
-    fun local(name: String, src_struct: hw_struct): neuro_local {
-        var ret_var = neuro_local(name, hw_type(src_struct), "0")
-        add_local(ret_var)
-        return ret_var
-    }
-
-    fun ulocal(name: String, dimensions: hw_dim_static, defimm: hw_imm): neuro_local {
-        var ret_var = neuro_local(name, hw_type(DATA_TYPE.BV_UNSIGNED, dimensions), defimm)
-        add_local(ret_var)
-        return ret_var
-    }
-
-    fun ulocal(name: String, dimensions: hw_dim_static, defval: String): neuro_local {
-        var ret_var = neuro_local(name, hw_type(DATA_TYPE.BV_UNSIGNED, dimensions), defval)
-        add_local(ret_var)
-        return ret_var
-    }
-
-    fun ulocal(name: String, msb: Int, lsb: Int, defimm: hw_imm): neuro_local {
-        var ret_var = neuro_local(name, hw_type(DATA_TYPE.BV_UNSIGNED, msb, lsb), defimm)
-        add_local(ret_var)
-        return ret_var
-    }
-
-    fun ulocal(name: String, msb: Int, lsb: Int, defval: String): neuro_local {
-        var ret_var = neuro_local(name, hw_type(DATA_TYPE.BV_UNSIGNED, msb, lsb), defval)
-        add_local(ret_var)
-        return ret_var
-    }
-
-    fun ulocal(name: String, defimm: hw_imm): neuro_local {
-        var ret_var = neuro_local(name, hw_type(DATA_TYPE.BV_UNSIGNED, defimm.imm_value), defimm)
-        add_local(ret_var)
-        return ret_var
-    }
-
-    fun ulocal(name: String, defval: String): neuro_local {
-        var ret_var = neuro_local(name, hw_type(DATA_TYPE.BV_UNSIGNED, defval), defval)
-        add_local(ret_var)
-        return ret_var
-    }
-
-    fun slocal(name: String, dimensions: hw_dim_static, defimm: hw_imm): neuro_local {
-        var ret_var = neuro_local(name, hw_type(DATA_TYPE.BV_SIGNED, dimensions), defimm)
-        add_local(ret_var)
-        return ret_var
-    }
-
-    fun slocal(name: String, dimensions: hw_dim_static, defval: String): neuro_local {
-        var ret_var = neuro_local(name, hw_type(DATA_TYPE.BV_SIGNED, dimensions), defval)
-        add_local(ret_var)
-        return ret_var
-    }
-
-    fun slocal(name: String, msb: Int, lsb: Int, defimm: hw_imm): neuro_local {
-        var ret_var = neuro_local(name, hw_type(DATA_TYPE.BV_SIGNED, msb, lsb), defimm)
-        add_local(ret_var)
-        return ret_var
-    }
-
-    fun slocal(name: String, msb: Int, lsb: Int, defval: String): neuro_local {
-        var ret_var = neuro_local(name, hw_type(DATA_TYPE.BV_SIGNED, msb, lsb), defval)
-        add_local(ret_var)
-        return ret_var
-    }
-
-    fun slocal(name: String, defimm: hw_imm): neuro_local {
-        var ret_var = neuro_local(name, hw_type(DATA_TYPE.BV_SIGNED, defimm.imm_value), defimm)
-        add_local(ret_var)
-        return ret_var
-    }
-
-    fun slocal(name: String, defval: String): neuro_local {
-        var ret_var = neuro_local(name, hw_type(DATA_TYPE.BV_SIGNED, defval), defval)
-        add_local(ret_var)
-        return ret_var
-    }
-
-
-    fun global(name: String, vartype: hw_type, defimm: hw_imm): neuro_global {
-        var ret_var = neuro_global(name, vartype, defimm)
-        add_global(ret_var)
-        return ret_var
-    }
-
-    fun global(name: String, vartype: hw_type, defval: String): neuro_global {
-        var ret_var = neuro_global(name, vartype, defval)
-        add_global(ret_var)
-        return ret_var
-    }
-
-    fun global(name: String, src_struct: hw_struct, dimensions: hw_dim_static): neuro_global {
-        var ret_var = neuro_global(name, hw_type(src_struct, dimensions), "0")
-        add_global(ret_var)
-        return ret_var
-    }
-
-    fun global(name: String, src_struct: hw_struct): neuro_global {
-        var ret_var = neuro_global(name, hw_type(src_struct), "0")
-        add_global(ret_var)
-        return ret_var
-    }
-
-    fun uglobal(name: String, dimensions: hw_dim_static, defimm: hw_imm): neuro_global {
-        var ret_var = neuro_global(name, hw_type(DATA_TYPE.BV_UNSIGNED, dimensions), defimm)
-        add_global(ret_var)
-        return ret_var
-    }
-
-    fun uglobal(name: String, dimensions: hw_dim_static, defval: String): neuro_global {
-        var ret_var = neuro_global(name, hw_type(DATA_TYPE.BV_UNSIGNED, dimensions), defval)
-        add_global(ret_var)
-        return ret_var
-    }
-
-    fun uglobal(name: String, msb: Int, lsb: Int, defimm: hw_imm): neuro_global {
-        var ret_var = neuro_global(name, hw_type(DATA_TYPE.BV_UNSIGNED, msb, lsb), defimm)
-        add_global(ret_var)
-        return ret_var
-    }
-
-    fun uglobal(name: String, msb: Int, lsb: Int, defval: String): neuro_global {
-        var ret_var = neuro_global(name, hw_type(DATA_TYPE.BV_UNSIGNED, msb, lsb), defval)
-        add_global(ret_var)
-        return ret_var
-    }
-
-    fun uglobal(name: String, defimm: hw_imm): neuro_global {
-        var ret_var = neuro_global(name, hw_type(DATA_TYPE.BV_UNSIGNED, defimm.imm_value), defimm)
-        add_global(ret_var)
-        return ret_var
-    }
-
-    fun uglobal(name: String, defval: String): neuro_global {
-        var ret_var = neuro_global(name, hw_type(DATA_TYPE.BV_UNSIGNED, defval), defval)
-        add_global(ret_var)
-        return ret_var
-    }
-
-    fun sglobal(name: String, dimensions: hw_dim_static, defimm: hw_imm): neuro_global {
-        var ret_var = neuro_global(name, hw_type(DATA_TYPE.BV_SIGNED, dimensions), defimm)
-        add_global(ret_var)
-        return ret_var
-    }
-
-    fun sglobal(name: String, dimensions: hw_dim_static, defval: String): neuro_global {
-        var ret_var = neuro_global(name, hw_type(DATA_TYPE.BV_SIGNED, dimensions), defval)
-        add_global(ret_var)
-        return ret_var
-    }
-
-    fun sglobal(name: String, msb: Int, lsb: Int, defimm: hw_imm): neuro_global {
-        var ret_var = neuro_global(name, hw_type(DATA_TYPE.BV_SIGNED, msb, lsb), defimm)
-        add_global(ret_var)
-        return ret_var
-    }
-
-    fun sglobal(name: String, msb: Int, lsb: Int, defval: String): neuro_global {
-        var ret_var = neuro_global(name, hw_type(DATA_TYPE.BV_SIGNED, msb, lsb), defval)
-        add_global(ret_var)
-        return ret_var
-    }
-
-    fun sglobal(name: String, defimm: hw_imm): neuro_global {
-        var ret_var = neuro_global(name, hw_type(DATA_TYPE.BV_SIGNED, defimm.imm_value), defimm)
-        add_global(ret_var)
-        return ret_var
-    }
-
-    fun sglobal(name: String, defval: String): neuro_global {
-        var ret_var = neuro_global(name, hw_type(DATA_TYPE.BV_SIGNED, defval), defval)
-        add_global(ret_var)
-        return ret_var
-    }
-
-    fun somatic_phase(name: String, postsyn_neurons: Int ) : hw_somatic_phase {
-        var new_phase = hw_somatic_phase(name, this)
-        return new_phase
-    }
-
-    fun synaptic_phase(name: String, presyn_neurons: Int, postsyn_neurons: Int ) : hw_synaptic_phase {
-        var new_phase = hw_synaptic_phase(name, this)
-        return new_phase
-    }
-
-    fun begproc_soma(neurohandler: hw_somatic_phase) {
-        this.add(neurohandler)
-    }
-
-    fun begproc_syna(neurohandler: hw_synaptic_phase) {
-        this.add(neurohandler)
-    }
-
-
-
-    fun input_queue_gen(model_params: SnnArch): cyclix.Generic{
-        var cyclix_gen = cyclix.Generic(name)
-
-        val STATE_IDLE = 0
-        val STATE_PROCESSING = 1
-
-        val en_core = cyclix_gen.uport("en_core", PORT_DIR.IN, hw_dim_static(1), "0")
-        val reg_en_core = cyclix_gen.uglobal("reg_en_core", hw_dim_static(1), "0")
-        reg_en_core.assign(en_core) // todo: заменить в сгенерированном верилоге
-
-        //  generation tick
-        var tick =  cyclix_gen.uglobal("tick", hw_dim_static(1),"0")
-        val tickGen = TickGenerator()
-        tickGen.tick_generation(tick, 300, "ns", 10, cyclix_gen)
-//
-
-
-        // Переменная для отслеживания состояния обработки
-        val current_state = cyclix_gen.uglobal("current_state", hw_dim_static(2, 0), "0")
-        val next_state = cyclix_gen.uglobal("next_state", hw_dim_static(2, 0), "0")
-        current_state.assign(next_state)
-
-
-
-        val queues = Queues()
-
-        val input_queue = queues.input_queue_generation_credit_counter(
-            "input_queue",
-//            model_params.spike_width,                  // data_width
-            8,
-            9,                  // log2(1024)
-            model_params.presyn_neurons - 1, // depth
-            tick,
-            cyclix_gen
-        )
-
-        val all_spikes_read_for_this_tick = cyclix_gen.uglobal("all_spikes_read_for_this_tick", hw_dim_static(0, 0), "0")
-
-        // Логика контроллера
-        cyclix_gen.begif(cyclix_gen.eq2(reg_en_core, 1))  // Если старт обработки активен
-        run {
-            cyclix_gen.begif(cyclix_gen.eq2(current_state, STATE_IDLE))  // Состояние "идл"
-            run {
-//                input_queue.rd_if.assign(0)
-//                postsyn_counter.assign(0)
-                next_state.assign(STATE_PROCESSING)
-            }; cyclix_gen.endif()
-
-            // Процедура подсчета постсинаптических нейронов
-            cyclix_gen.begif(cyclix_gen.eq2(current_state, STATE_PROCESSING))  // Состояние "идл"
-            run {
-
-                cyclix_gen.begif(cyclix_gen.eq2(tick, 1))
-                run {
-                    all_spikes_read_for_this_tick.assign(0)
-                };cyclix_gen.endif()
-
-                cyclix_gen.begif(cyclix_gen.eq2(input_queue.rdCounter, 0))
-                run {
-                    all_spikes_read_for_this_tick.assign(1)
-//                    input_queue.rd_if.assign(1)
-
-
-//                    adr_ram_i_r.assign(cyclix_gen.cnct(input_queue.r_data_if, postsyn_counter)) // устанавливаем адрес для чтения веса
-//                    weight_input_layer.assign(dat_ram_o_r)  // читаем вес
-//                                        internal_queue.rd_if.assign(1)
-//                    l1_membrane_potential_memory.buf_param_1[postsyn_counter].assign(l1_membrane_potential_memory.buf_param_1[postsyn_counter].plus(weight_input_layer))
-
-//                    cyclix_gen.begif(cyclix_gen.eq2(postsyn_counter_done, 1))  // Состояние "идл"
-//                    run {
-//                        input_queue.rd_if.assign(0)
-//                    };cyclix_gen.endif()
-                };cyclix_gen.endif()
-
-//                cyclix_gen.begelse()
-                cyclix_gen.begif(cyclix_gen.eq2(all_spikes_read_for_this_tick, 1))
-                run{
-                    input_queue.rd_if.assign(0)
-                };cyclix_gen.endif()
-                cyclix_gen.begelse()
-                run {
-                    input_queue.rd_if.assign(1)
-                };cyclix_gen.endif()
-
-            };cyclix_gen.endif()
-
-
-
-
-        };cyclix_gen.endif()
-        return cyclix_gen
-    }
-
-
-
-fun core_generate(debug_lvl : DEBUG_LEVEL, model_params: SnnArch ): cyclix.Generic {
     var cyclix_gen = cyclix.Generic(name)
 
-    // Control Registers
-    var PresynNeuronsNumsParam = cyclix_gen.uglobal("PresynNeuronsNumsParam", hw_dim_static(16),"0")
-    var PostsynNeuronsNumsParam = cyclix_gen.uglobal("PostsynNeuronsNumsParam", hw_dim_static(16),"0")
-    var LeakageParam = cyclix_gen.uglobal("LeakageParam", hw_dim_static(8),"0")
-    var ThresholdParam = cyclix_gen.uglobal("ThresholdParam", hw_dim_static(8),"0")
-    var ResetParam = cyclix_gen.uglobal("ResetParam", hw_dim_static(8),"0")
-
-    //  generation tick
-    var tick =  cyclix_gen.uglobal("tick", hw_dim_static(1),"0")
-    val tickGen = TickGenerator()
-    tickGen.tick_generation(tick, 400, "ns", 10, cyclix_gen)
-//
-    val queues = Queues()
-
-    val input_queue = queues.input_queue_generation_credit_counter(
-        "input_queue",
-        model_params.spike_width,                  // data_width
-        9,                  // log2(1024)
-        model_params.presyn_neurons - 1, // depth
-        tick,
-        cyclix_gen
-    )
-
-    val output_queue = queues.output_queue_generation_credit_counter(
-        "output_queue",
-        model_params.spike_width,                  // data_width
-        9,                  // log2(1024)
-        model_params.postsyn_neurons - 1, // depth
-        tick,
-        cyclix_gen
-    )
-
-    // Интерфейс памяти весовых параметров
-    val adr_ram_i = cyclix_gen.uport("adr_ram_i", PORT_DIR.OUT, hw_dim_static(8), "0") // log2(presyn*postsyn)
-    val adr_ram_i_r = cyclix_gen.uglobal("adr_ram_i_r", hw_dim_static(8), "0")
-    adr_ram_i.assign(adr_ram_i_r)
-
-    val dat_ram_o = cyclix_gen.uport("dat_ram_o", PORT_DIR.IN, hw_dim_static(model_params.weightWidth), "0")
-    val dat_ram_o_r = cyclix_gen.uglobal("dat_ram_o_r", hw_dim_static(model_params.weightWidth), "0")
-    dat_ram_o_r.assign(dat_ram_o)
-
-//     Память мембранных потенциалов
-    val l1_dynamicParam = DynamicParam("l1_membrane_potential_memory", model_params.potentialWidth, model_params.postsyn_neurons)
-    var l1_membrane_potential_memory = l1_dynamicParam.generate(cyclix_gen, tick)
-
-//    val l2_dynamicParam = DynamicParam("l2_membrane_potential_memory", model_params.potentialWidth, model_params.postsyn_neurons)
-//    var l2_membrane_potential_memory = l2_dynamicParam.generate(cyclix_gen, tick)
-
-//    val internal_queue = queues.internal_spike_buffer_generation_credit_counter(
-//        "internal_queue_",
-//        model_params.spike_width,                  // data_width
-//        9,                  // log2(1024)
-//        model_params.postsyn_neurons - 1, // depth
-//        tick,
-//        cyclix_gen
-//    )
-
-    // Контроллер
-    val en_core = cyclix_gen.uport("en_core", PORT_DIR.IN, hw_dim_static(1), "0")
-    val reg_en_core = cyclix_gen.uglobal("reg_en_core", hw_dim_static(1), "0")
-    reg_en_core.assign(en_core) // todo: заменить в сгенерированном верилоге
-
-    // Состояния контроллера для одного слоя
-    val STATE_IDLE = 0
-    val STATE_PROCESSING = 1
-
-    // Переменная для отслеживания состояния обработки
-    val current_state = cyclix_gen.uglobal("current_state", hw_dim_static(2, 0), "0")
-    val next_state = cyclix_gen.uglobal("next_state", hw_dim_static(2, 0), "0")
-    current_state.assign(next_state)
-
-    val postsyn_counter = cyclix_gen.uglobal("postsyn_counter", hw_dim_static(8), "0")  // Параметризировать разрядность
-//    val input_layer_presyn_neuron_id = cyclix_gen.uglobal("input_layer_presyn_neuron_id", hw_dim_static(model_params.spike_width), "0")
-
-    val weight_input_layer = cyclix_gen.uglobal("weight_input_layer", hw_dim_static(model_params.weightWidth), "0")
-////    val weight_hidden_layer = cyclix_gen.uglobal("weight_hidden_layer", hw_dim_static(model_params.weightWidth), "0")
-
-    val postsyn_counter_done = cyclix_gen.uglobal("postsyn_counter_done", hw_dim_static(16), "0")
-
-  // Логика контроллера
-    cyclix_gen.begif(cyclix_gen.eq2(reg_en_core, 1))  // Если старт обработки активен
-    run {
-        cyclix_gen.begif(cyclix_gen.eq2(current_state, STATE_IDLE))  // Состояние "идл"
-        run {
-            input_queue.rd_if.assign(0)
-//            input_layer_presyn_neuron_id.assign(0)
-            postsyn_counter.assign(0)
-
-            next_state.assign(STATE_PROCESSING)
-        }; cyclix_gen.endif()
-
-        cyclix_gen.begif(cyclix_gen.eq2(tick, 1))
-        run {
-            postsyn_counter_done.assign(0)
-        };cyclix_gen.endif()
-
-        // Процедура подсчета постсинаптических нейронов
-        cyclix_gen.begif(cyclix_gen.eq2(current_state, STATE_PROCESSING))  // Состояние "идл"
-        run {
-            cyclix_gen.begif(cyclix_gen.less(postsyn_counter, PostsynNeuronsNumsParam))  // Значение из управляющего регистра
-            run {
-                postsyn_counter.assign(postsyn_counter.plus(1))
-            };cyclix_gen.endif()
-            cyclix_gen.begelse()
-            run{
-                postsyn_counter.assign(0)
-                postsyn_counter_done.assign(1)
-            };cyclix_gen.endif()
-        };cyclix_gen.endif()
-
-
-
-//        cyclix_gen.begif(cyclix_gen.eq2(current_state, STATE_PROCESSING))  // Состояние обработки
-//        run {
-//            // Устанавливаем сигнал на чтение входящего буфера
-//            input_queue.rd_if.assign(1)
-//        };cyclix_gen.endif()
-
-        // Процедура взвешивания входных спайков
-        cyclix_gen.begif(cyclix_gen.neq2(input_queue.rdCounter, 0))
-        run {
-            input_queue.rd_if.assign(1)
-            adr_ram_i_r.assign(cyclix_gen.cnct(input_queue.r_data_if, postsyn_counter)) // устанавливаем адрес для чтения веса
-            weight_input_layer.assign(dat_ram_o_r)  // читаем вес
-    //                    internal_queue.rd_if.assign(1)
-            l1_membrane_potential_memory.buf_param_1[postsyn_counter].assign(l1_membrane_potential_memory.buf_param_1[postsyn_counter].plus(weight_input_layer))
-
-            cyclix_gen.begif(cyclix_gen.eq2(postsyn_counter_done, 1))  // Состояние "идл"
-            run {
-                input_queue.rd_if.assign(0)
-            };cyclix_gen.endif()
-        };cyclix_gen.endif()
-
-        val membr_pot_l1 = cyclix_gen.ulocal("membr_pot_l1", hw_dim_static( model_params.potentialWidth), "0")
-        cyclix_gen.begif(cyclix_gen.land(cyclix_gen.less(postsyn_counter, PostsynNeuronsNumsParam-1), cyclix_gen.neq2(postsyn_counter_done, 0) ))
-        run {
-            membr_pot_l1.assign(l1_membrane_potential_memory.buf_param_2[postsyn_counter].minus(LeakageParam))
-
-            cyclix_gen.begif(cyclix_gen.geq(membr_pot_l1, ThresholdParam))
-            run {
-    //                        l1_wr_sig.assign(1)
-    //                        l1_trg_neuron_id.assign(postsyn_counter)
-                output_queue.we_i.assign(1)
-                output_queue.wr_data_i.assign(postsyn_counter)
-                l1_membrane_potential_memory.buf_param_2[postsyn_counter].assign(ResetParam)
-            }; cyclix_gen.endif()
-
-            cyclix_gen.begelse()
-            run{
-                output_queue.we_i.assign(0)
-            };cyclix_gen.endif()
-
-        };cyclix_gen.endif()
-
-    };cyclix_gen.endif()
-
-    return cyclix_gen
 }
 
-//    fun translate(debug_lvl : DEBUG_LEVEL) : cyclix.Generic {
-//        var cyclix_gen = cyclix.Generic(name)
-//
-//        val presyn_neurons = 128
-//        val postsyn_neurons = 128
-//        val weight_width = 4
-//        val potential_width = 7
-//        val threshold = 1
-//        val leak = 1
-//        val reset_voltage = 0
-//        MSG(""+presyn_neurons+postsyn_neurons+weight_width+potential_width)
-//
-//        //  generation tick
-//        var tick =  cyclix_gen.uglobal("tick", "0")
-//        val tickGen = TickGenerator()
-//        tickGen.tick_generation(tick, 100, "ns", 10, cyclix_gen)
-//
-//
-//
-//        val queues = Queues()
-//
-//// Инициализация входящей очереди и получение структуры с интерфейсными сигналами и каунтерами
-//        val inputQueueCounters = queues.input_queue_generation_credit_counter(
-//            "L1_input_queue",
-//            8,                  // data_width
-//            4,                  // pointer_width
-//            presyn_neurons - 1, // depth
-//            tick,
-//            cyclix_gen
-//        )
-//
-//// Инициализация исходящей очереди и получение структуры с интерфейсными сигналами и каунтерами
-//        val outputQueueCounters = queues.output_queue_generation_credit_counter(
-//            "l1_output_queue",
-//            8,                  // data_width
-//            4,                  // pointer_width
-//            postsyn_neurons - 1, // depth
-//            tick,
-//            cyclix_gen
-//        )
-//
-//
-//        // Память весов
-//        val weightMemory = StaticParams("l1_weights_mem", weight_width, presyn_neurons, postsyn_neurons)
-//        var l1_weight_memory = weightMemory.generate(cyclix_gen)
-//
-//        // Память статических параметров
-//        val dynamicParam = DynamicParam("l1_membrane_potential_memory", potential_width, postsyn_neurons)
-//        var l1_membrane_potential_memory = dynamicParam.generate(cyclix_gen)
-//
-//
-//
-//        // Контроллер
-//        val en_core = cyclix_gen.uport("en_core", PORT_DIR.IN, hw_dim_static(1), "0")
-//        val reg_en_core = cyclix_gen.uglobal("reg_en_core", hw_dim_static(1), "0")
-//        reg_en_core.assign(en_core) // todo: заменить в сгенерированном верилоге
-//
-//        // Состояния контроллера для одного слоя
-//        val STATE_IDLE = 0
-//        val STATE_READ_IN_SPK = 1
-//        val STATE_SYNAPTIC = 2
-//        val STATE_SOMATIC = 3
-//        val STATE_EMISSION = 4
-//
-//        // Переменная для отслеживания состояния обработки
-//        val current_state = cyclix_gen.uglobal("current_state", hw_dim_static(2, 0), "0")
-//        val next_state = cyclix_gen.uglobal("next_state", hw_dim_static(2, 0), "0")
-//        current_state.assign(next_state)
-//
-//        val postsyn_counter = cyclix_gen.uglobal("postsyn_counter", hw_dim_static(8), "0")  // Параметризировать разрядность
-//        val l1_presyn_neuron_id = cyclix_gen.uglobal("l1_presyn_neuron_id", hw_dim_static(8), "0")
-//
-//        val presyn_cnt = cyclix_gen.uglobal("presyn_cnt", hw_dim_static(8), "0")
-//
-//
-////        // Память весов
-////        var l1_weights_mem_ext_dim = hw_dim_static(weight_width)
-////        l1_weights_mem_dim.add(postsyn_neurons-1, 0)  // 256
-////        var l1_weights_mem_ext = cyclix_gen.sglobal("l1_weights_mem_ext", l1_weights_mem_ext_dim, "0")
-////
-//        // Логика контроллера
-//        cyclix_gen.begif(cyclix_gen.eq2(reg_en_core, 1))  // Если старт обработки активен
-//        run {
-//            cyclix_gen.begif(cyclix_gen.eq2(current_state, STATE_IDLE))  // Состояние "идл"
-//            run {
-//                inputQueueCounters.rd_if.assign(0)
-//                presyn_cnt.assign(0)
-//                l1_presyn_neuron_id.assign(0)
-//                postsyn_counter.assign(0)
-//
-//                next_state.assign(STATE_READ_IN_SPK)
-//            }; cyclix_gen.endif()
-//
-//            cyclix_gen.begif(cyclix_gen.eq2(current_state, STATE_READ_IN_SPK))
-//            run {
-//                cyclix_gen.begif(cyclix_gen.eq2(tick, 1))
-//                run {
-//                    inputQueueCounters.rd_if.assign(1)
-//                    next_state.assign(STATE_SYNAPTIC)
-//                }; cyclix_gen.endif()
-//            }; cyclix_gen.endif()
-//
-//            // Обработка пресинаптического счётчика
-//            cyclix_gen.begif(cyclix_gen.eq2(current_state, STATE_SYNAPTIC))
-//            run {
-////                l1_rd_sig.assign(1)
-////                l1_presyn_neuron_id.assign(l1_src_neuron_id)
-//                cyclix_gen.begif(cyclix_gen.neq2(inputQueueCounters.rdCounter, presyn_cnt))
-//                run {
-//                    for (i in 0..postsyn_neurons - 1) {
-//                        //                l1_weights_mem_ext.assign(l1_weight_memory[l1_presyn_neuron_id][i])
-//                        l1_membrane_potential_memory[i].assign(l1_membrane_potential_memory[i].plus(l1_weight_memory[inputQueueCounters.r_data_if][i]))
-//                    }
-//                };cyclix_gen.endif()
-////            }; cyclix_gen.endif()
-//                cyclix_gen.begelse()
-//                run {
-//                   // l1_rd_sig.assign(0)
-//                    next_state.assign(STATE_SOMATIC)
-//                }; cyclix_gen.endif()
-//
-//            }; cyclix_gen.endif()
-//
-//            cyclix_gen.begif(cyclix_gen.eq2(current_state, STATE_SOMATIC))
-//            run {
-//                for (i in 0..postsyn_neurons - 1) {
-//                    //                l1_weights_mem_ext.assign(l1_weight_memory[l1_presyn_neuron_id][i])
-//                    l1_membrane_potential_memory[i].assign(cyclix_gen.srl(l1_membrane_potential_memory[i], leak))
-////                    l1_membrane_potential_memory[i].assign(l1_membrane_potential_memory[i].minus(1))
-//                }
-//
-//                postsyn_counter.assign(0)
-////                    next_state.assign(STATE_EMISSION)
-//                next_state.assign(STATE_EMISSION)
-//            }; cyclix_gen.endif()
-//
-//            cyclix_gen.begif(cyclix_gen.eq2(current_state, STATE_EMISSION))
-//            run {
-//
-//                cyclix_gen.begif(cyclix_gen.less(postsyn_counter, postsyn_neurons-1))
-//                run {
-//                    cyclix_gen.begif(cyclix_gen.geq(l1_membrane_potential_memory[postsyn_counter], threshold))
-//                    run {
-////                        l1_wr_sig.assign(1)
-////                        l1_trg_neuron_id.assign(postsyn_counter)
-//                        outputQueueCounters.wr_if.assign(1)
-//                        outputQueueCounters.w_data_if.assign(postsyn_counter)
-//                        l1_membrane_potential_memory[postsyn_counter].assign(reset_voltage)
-//                    }; cyclix_gen.endif()
-//                    cyclix_gen.begelse()
-//                    run{
-//                        outputQueueCounters.wr_if.assign(0)
-//                    };cyclix_gen.endif()
-//
-//                    postsyn_counter.assign(postsyn_counter.plus(1))
-//                }; cyclix_gen.endif()
-//
-//                cyclix_gen.begif(cyclix_gen.eq2(postsyn_counter, postsyn_neurons-1))
-//                run{
-//                    postsyn_counter.assign(0)
-//                    next_state.assign(STATE_IDLE)
-//                };cyclix_gen.endif()
-//            }; cyclix_gen.endif() // cyclix_gen.begif(cyclix_gen.eq2(current_state, STATE_EMISSION))
-//
-//            }; cyclix_gen.endif()
-//
-//        return cyclix_gen
-//    }
-}
-
-fun main(){
-
-}
