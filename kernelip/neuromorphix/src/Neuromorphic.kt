@@ -27,30 +27,31 @@ private fun NmMath.log2ceil(v: Int): Int {
 
 
 class Neuromorphic(
-    val name : String,
-//    val NN_model_params: SnnArch
+    val name: String
 ) : hw_astc_stdif() {
 
-    val g = cyclix.Generic(name)
+    private val g = cyclix.Generic(name)
 
-    val tick = g.uglobal("tick", "0")
-    private val tg = TickGen("tg0")
+    // tick
+    private val tick = g.uglobal("tick", "0")
+    private val tg   = TickGen("tg0")
 
-    // очереди FIFO
+    // компоненты
     private val inFifo  = FifoInput("in0")
     private val outFifo = FifoOutput("out0")
-
-    private val dynVm = DynamicParamMem("vmem")
-
-    private val wIfGen = StaticMemIfGen("wif0")
-
+    private val dynVm   = DynamicParamMem("vmem")
+    private val wIfGen  = StaticMemIfGen("wif0")
 
     init {
-        // тик: 1мс при 100МГц
-        tg.emit(g, TickGenCfg(timeslot = 1, unit = TimeUnit.MS, clkPeriodNs = 10), tick)
+        // 1) Тик: 1 мс при 100 МГц
+        tg.emit(
+            g,
+            TickGenCfg(timeslot = 1, unit = TimeUnit.MS, clkPeriodNs = 10),
+            tick
+        )
 
-        // входная очередь: 32-бит слово, глубина 64, кредиты 8 бит, переключение по tick
-        val fifoIf = inFifo.emit(
+        // 2) Входной FIFO
+        val fifoInIf = inFifo.emit(
             g = g,
             cfg = FifoCfg(
                 name = "spike_in",
@@ -62,7 +63,7 @@ class Neuromorphic(
             tick = tick
         )
 
-        // выходная очередь: 32-бит слово, глубина 64, кредиты 8 бит, переключение по tick
+        // 3) Выходной FIFO (на будущее)
         val fifoOutIf = outFifo.emit(
             g = g,
             cfg = FifoCfg(
@@ -75,99 +76,92 @@ class Neuromorphic(
             tick = tick
         )
 
-        // Память динамических параметров: Vmemb[PostsynNeurons] по 16 бит
+        // 4) Динамическая память (напр., Vmemb)
         val vmIf = dynVm.emit(
             g = g,
             cfg = DynParamCfg(
                 name = "Vmemb",
                 bitWidth = 16,
-                count = 8 // model.PostsynNeuronsCount
+                count = 8      // TODO: model.PostsynNeuronsCount
             )
         )
 
-        val pre = 8 //model.PresynNeuronsCount
-        val post = 8 // model.PostsynNeuronsCount
-
+        // 5) Интерфейс к статической памяти весов
+        val pre  = 8   // TODO: model.PresynNeuronsCount
+        val post = 8   // TODO: model.PostsynNeuronsCount
         val wIf = wIfGen.emit(
             g = g,
             cfg = StaticMemCfg(
                 name = "w_l1",
-                wordWidth = 8, // model.weightBitWidth,
+                wordWidth = 8,                 // TODO: model.weightBitWidth
                 depth = pre * post,
-//                addrMode = AddrMode.CONCAT,           // или LINEAR
-                preIdxWidth = NmMath.log2ceil(pre),          // для CONCAT
+                preIdxWidth  = NmMath.log2ceil(pre),
                 postIdxWidth = NmMath.log2ceil(post),
-                postsynCount = post,                  // для LINEAR (если выберешь)
+                postsynCount = post,
                 useEn = true
             )
         )
 
-//// 1) интерфейс к статической памяти весов (как мы делали раньше)
-//        val wIfGen = StaticMemIfGen()
-//        val wIf = wIfGen.emit(
-//            g = g,
-//            cfg = StaticMemIfCfg(
-//                name = "W",
-//                addrWidth = /* NmMath.log2ceil(Presyn*Postsyn) */,
-//                dataWidth = 16,     // ширина веса
-//                exposeEn   = true
-//            )
-//        )
+        // 6) Регистр-банк (интерфейсные регистры ядра)
+        val rbCfg = RegBankCfg(
+            bankName = "core_cfg",
+            regs = listOf(
+                RegDesc("threshold",     width = 12, init = "0"),
+                RegDesc("leakage",       width = 8,  init = "0"),
+                RegDesc("baseAddr",      width = 32, init = "0"),
+                RegDesc("postsynCount",  width = 16, init = "0"),
+                RegDesc("layerBase",     width = 32, init = "0", count = 4)
+            ),
+            prefix = "cfg"
+        )
+        val regBank = RegBankGen("rb0").emit(g, rbCfg)
 
-// 2) рантайм-регистры (приходят из другого модуля/рег.файла)
-        val postsynCnt_r = g.uglobal("postsyn_cnt", hw_dim_static(NmMath.log2ceil(256)), "0")  // пример
-        val baseAddr_r   = g.uglobal("w_base",      hw_dim_static(16), "0")             // опционально
-        val rt = RegIf(postsynCount = postsynCnt_r, baseAddr = baseAddr_r)
+        // Примеры чтения значений из банкa
+        val thr     = regBank["threshold"]
+        val leak    = regBank["leakage"]
+        val baseAdr = regBank["baseAddr"]
+        val postsynCnt = regBank["postsynCount"]
 
-// 3) селектор
+        // 7) Рантайм-интерфейс для селектора (из регистров)
+        val rt = RegIf(
+            postsynCount = postsynCnt,
+            baseAddr = baseAdr
+        )
+
+        // 8) Селектор синапсов (ставит adr_r/en_r для wIf)
         val sel = SynapseSelector("sel0")
         val selIf = sel.emit(
             g     = g,
             cfg   = SynSelCfg(
                 name          = "sel0",
-                addrWidth     = 8 /* ширина адреса W */,
-                preWidth      = 8 /* NmMath.log2ceil(Presyn) */,
-                postWidth     = 8 /* NmMath.log2ceil(Postsyn max) */,
-                stepByTick    = false,        // можно шагать по tick
+                addrWidth     = wIf.addrWidth,               // ширина адреса реально из интерфейса
+                preWidth      = NmMath.log2ceil(pre),
+                postWidth     = NmMath.log2ceil(post),
+                stepByTick    = false,
                 useLinearAddr = true
             ),
             topo  = TopologySpec(TopologyKind.FULLY_CONNECTED),
             rt    = rt,
-            tick  = tick,                    // если stepByTick=true
-            mem   = wIf                      // селектор сам ставит adr_r/en_r
+            tick  = tick,
+            mem   = wIf
         )
 
-        val rbCfg = RegBankCfg(
-            bankName = "core_cfg",
-            regs = listOf(
-                RegDesc("threshold", width = 12, init = "0"),
-                RegDesc("leakage",   width = 8,  init = "0"),
-                RegDesc("baseAddr",  width = 32, init = "0"),
-                RegDesc("postsynCount", width = 16, init = "0"),
-                // пример массива (например, несколько базовых адресов для разных слоёв)
-                RegDesc("layerBase", width = 32, init = "0", count = 4)
+        // 9) Обработчик синаптической фазы
+        val syn = SynapticPhase("syn")
+        val synIf = syn.emit(
+            g      = g,
+            cfg    = SynPhaseCfg(
+                name = "syn",
+                op = SynOpKind.ADD,
+                preIdxWidth = NmMath.log2ceil(pre)   // ширина индекса пресинаптического нейрона
             ),
-            prefix = "cfg"
+            inFifo = fifoInIf,   // интерфейс входного FIFO
+            sel    = selIf,      // интерфейс селектора
+            wmem   = wIf,        // интерфейс статической памяти весов
+            dyn    = vmIf        // интерфейс динамической памяти (Vmemb)
         )
 
-        // 2) генерируем банк, возвращается интерфейс для подключения
-        val regBank = RegBankGen("rb0").emit(g, rbCfg)
-
-        // 3) внутри ядра читаем зарегистрированные значения:
-        val thr      = regBank["threshold"]
-        val leak     = regBank["leakage"]
-        val baseAddr = regBank["baseAddr"]
-        val postsyn  = regBank["postsynCount"]
-        val layer0   = regBank["layerBase"]    // это массив; обращаться как layer0[index]
-
-
-// 4) где-то в FSM:
-//  - задать selIf.preIdx_i.assign(currPre) для нужного пресинапса
-//  - импульс selIf.start_i := 1, затем 0
-//  - ждать selIf.done_o == 1
-//  - читать wIf.dat_r как данные веса для каждого шага (пока идёт RUN)
-        // дальше PhaseFSM/обработчики будут пользоваться fifoIf.rd_o, fifoIf.rd_data_o, fifoIf.empty_o
-        // а внешний мир подключится к fifoIf.wr_i / wr_data_i / full_o
+        // дальше к FSM: используем synIf.busy/done или свои флаги, fifoOutIf и т.д.
     }
 
     fun build(): Generic = g

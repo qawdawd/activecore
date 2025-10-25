@@ -468,8 +468,6 @@ class DynamicParamMem(private val instName: String = "dynp") {
 }
 
 
-// === режим адресации для весовой памяти ===
-//enum class AddrMode { CONCAT, LINEAR }
 
 // === конфиг интерфейса статической (синаптической) памяти ===
 data class StaticMemCfg(
@@ -543,20 +541,6 @@ class StaticMemIfGen(private val instName: String = "wmem_if") {
         )
     }
 
-//    // ===== вспомогалки адресации (по желанию) =====
-//
-//    // CONCAT: adr = {preIdx[preW-1:0], postIdx[postW-1:0]}
-//    // (без умножителей; корректно, если глубина = 2^(preW+postW))
-//    fun addrConcat(g: Generic, preIdx: hw_var, postIdx: hw_var): hw_expr {
-//        return g.cnct(preIdx, postIdx)
-//    }
-//
-//    // LINEAR: adr = preIdx * postsynCount + postIdx
-//    // Требует наличия умножения в DSL (если нет — оставь CONCAT).
-//    fun addrLinear(g: Generic, preIdx: hw_var, postIdx: hw_var, postsynCount: Int): hw_expr {
-//        // если в DSL нет mul, можно заменить сдвигом при степени двойки
-//        return g.add(g.mul(preIdx, hw_imm(postsynCount)), postIdx)
-//    }
 }
 
 
