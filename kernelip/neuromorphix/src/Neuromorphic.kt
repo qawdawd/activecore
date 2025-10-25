@@ -161,6 +161,38 @@ class Neuromorphic(
             dyn    = vmIf        // интерфейс динамической памяти (Vmemb)
         )
 
+        // 10) Нейронная фаза: пример — сначала вычесть leakage, потом сдвинуть вправо на threshold
+        val neur = NeuronalPhase("neur")
+        val neurIf = neur.emit(
+            g   = g,
+            cfg = NeurPhaseCfg(
+                name = "neur",
+                idxWidth  = NmMath.log2ceil(post), // ширина счётчика пост-нейронов
+                dataWidth = 16,                    // ширина Vmemb (как в DynParamCfg)
+                ops = listOf(
+                    NeurOpSpec(NeurOpKind.SUB, "leakage"),   // acc := acc - leakage
+                    NeurOpSpec(NeurOpKind.SHR, "threshold")  // acc := acc >> threshold
+                )
+            ),
+            dyn  = vmIf,          // динамическая память (Vmemb)
+            regs = regBank,       // банк регистров (источники аргументов ops)
+            postsynCount = postsynCnt // сколько элементов обработать (из регистрового банка)
+        )
+
+// 11) Простой триггер: запускаем нейронную фазу сразу после завершения синаптической
+        val neurKick = g.uglobal("neur_kick", hw_dim_static(1), "0")
+
+// сгенерируем однотактный импульс стартa при synIf.done_o=1
+        g.begif(g.eq2(synIf.done_o, 1)); run {
+            neurKick.assign(1)
+        }; g.endif()
+        g.begelse(); run {
+            neurKick.assign(0)
+        }; g.endif()
+
+// подаём импульс на вход старта нейрофазы
+        neurIf.start_i.assign(neurKick)
+
         // дальше к FSM: используем synIf.busy/done или свои флаги, fifoOutIf и т.д.
     }
 
