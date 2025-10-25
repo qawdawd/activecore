@@ -3,7 +3,6 @@ package neuromorphix
 import org.json.JSONObject
 import java.io.File
 import kotlin.math.max
-import neuromorphix.NmMath
 
 
 /* ===== утилиты ===== */

@@ -194,6 +194,32 @@ class Neuromorphic(
         neurIf.start_i.assign(neurKick)
 
         // дальше к FSM: используем synIf.busy/done или свои флаги, fifoOutIf и т.д.
+
+        // Эмиттер спайков (сравнение Vmemb с порогом; при срабатывании — сброс в reset)
+        val emit = SpikeEmitter("emit")
+        val emitIf = emit.emit(
+            g   = g,
+            cfg = SpikeEmitCfg(
+                name       = "emit",
+                idxWidth   = NmMath.log2ceil(post),
+                cmp        = CmpKind.GE,
+                cmpRegKey  = "threshold",
+                refractory = true,
+                resetRegKey= "leakage"     // или отдельный "reset" регистр в твоём RegBankCfg
+            ),
+            out  = fifoOutIf,      // интерфейс выходного FIFO
+            dyn  = vmIf,           // динамическая память (Vmemb)
+            regs = regBank,        // банк регистров
+            postsynCount = postsynCnt
+        )
+
+// простой запуск эмиттера после завершения нейронной фазы:
+        val emitKick = g.uglobal("emit_kick", hw_dim_static(1), "0")
+        g.begif(g.eq2(neurIf.done_o, 1)); run { emitKick.assign(1) }; g.endif()
+        g.begelse(); run { emitKick.assign(0) }; g.endif()
+        emitIf.start_i.assign(emitKick)
+
+
     }
 
     fun build(): Generic = g
