@@ -16,7 +16,7 @@ import org.json.JSONObject
 import java.io.File
 import kotlin.math.pow
 
-private fun log2ceil(v: Int): Int {
+private fun NmMath.log2ceil(v: Int): Int {
     require(v > 0)
     var n = v - 1
     var r = 0
@@ -95,14 +95,77 @@ class Neuromorphic(
                 wordWidth = 8, // model.weightBitWidth,
                 depth = pre * post,
 //                addrMode = AddrMode.CONCAT,           // или LINEAR
-                preIdxWidth = log2ceil(pre),          // для CONCAT
-                postIdxWidth = log2ceil(post),
+                preIdxWidth = NmMath.log2ceil(pre),          // для CONCAT
+                postIdxWidth = NmMath.log2ceil(post),
                 postsynCount = post,                  // для LINEAR (если выберешь)
                 useEn = true
             )
         )
 
+//// 1) интерфейс к статической памяти весов (как мы делали раньше)
+//        val wIfGen = StaticMemIfGen()
+//        val wIf = wIfGen.emit(
+//            g = g,
+//            cfg = StaticMemIfCfg(
+//                name = "W",
+//                addrWidth = /* NmMath.log2ceil(Presyn*Postsyn) */,
+//                dataWidth = 16,     // ширина веса
+//                exposeEn   = true
+//            )
+//        )
 
+// 2) рантайм-регистры (приходят из другого модуля/рег.файла)
+        val postsynCnt_r = g.uglobal("postsyn_cnt", hw_dim_static(NmMath.log2ceil(256)), "0")  // пример
+        val baseAddr_r   = g.uglobal("w_base",      hw_dim_static(16), "0")             // опционально
+        val rt = RegIf(postsynCount = postsynCnt_r, baseAddr = baseAddr_r)
+
+// 3) селектор
+        val sel = SynapseSelector("sel0")
+        val selIf = sel.emit(
+            g     = g,
+            cfg   = SynSelCfg(
+                name          = "sel0",
+                addrWidth     = 8 /* ширина адреса W */,
+                preWidth      = 8 /* NmMath.log2ceil(Presyn) */,
+                postWidth     = 8 /* NmMath.log2ceil(Postsyn max) */,
+                stepByTick    = false,        // можно шагать по tick
+                useLinearAddr = true
+            ),
+            topo  = TopologySpec(TopologyKind.FULLY_CONNECTED),
+            rt    = rt,
+            tick  = tick,                    // если stepByTick=true
+            mem   = wIf                      // селектор сам ставит adr_r/en_r
+        )
+
+        val rbCfg = RegBankCfg(
+            bankName = "core_cfg",
+            regs = listOf(
+                RegDesc("threshold", width = 12, init = "0"),
+                RegDesc("leakage",   width = 8,  init = "0"),
+                RegDesc("baseAddr",  width = 32, init = "0"),
+                RegDesc("postsynCount", width = 16, init = "0"),
+                // пример массива (например, несколько базовых адресов для разных слоёв)
+                RegDesc("layerBase", width = 32, init = "0", count = 4)
+            ),
+            prefix = "cfg"
+        )
+
+        // 2) генерируем банк, возвращается интерфейс для подключения
+        val regBank = RegBankGen("rb0").emit(g, rbCfg)
+
+        // 3) внутри ядра читаем зарегистрированные значения:
+        val thr      = regBank["threshold"]
+        val leak     = regBank["leakage"]
+        val baseAddr = regBank["baseAddr"]
+        val postsyn  = regBank["postsynCount"]
+        val layer0   = regBank["layerBase"]    // это массив; обращаться как layer0[index]
+
+
+// 4) где-то в FSM:
+//  - задать selIf.preIdx_i.assign(currPre) для нужного пресинапса
+//  - импульс selIf.start_i := 1, затем 0
+//  - ждать selIf.done_o == 1
+//  - читать wIf.dat_r как данные веса для каждого шага (пока идёт RUN)
         // дальше PhaseFSM/обработчики будут пользоваться fifoIf.rd_o, fifoIf.rd_data_o, fifoIf.empty_o
         // а внешний мир подключится к fifoIf.wr_i / wr_data_i / full_o
     }
@@ -271,48 +334,49 @@ fun main() {
 //    }
 //}
 
-enum class NEURAL_NETWORK_TYPE {
-    SFNN, SCNN
-}
-
-
 val OP_SYN_PLUS = hwast.hw_opcode("syn_plus")
 
-open class SnnArch(
-    var name: String = "Default Name",
-    var nnType: NEURAL_NETWORK_TYPE = NEURAL_NETWORK_TYPE.SFNN,
-    var presyn_neurons: Int = 16,
-    var postsyn_neurons: Int = 16,
-    var outputNeur: Int = 10,
-    var weightWidth: Int = 8,
-    var potentialWidth: Int = 10,
-    var leakage: Int = 1,
-    var threshold: Int = 1,
-    var reset: Int = 0,
-    var spike_width: Int = 4,
-    var layers: Int = 2
-) {
-    fun loadModelFromJson(jsonFilePath: String) {
-        val jsonString = File(jsonFilePath).readText()
 
-        val jsonObject = JSONObject(jsonString)
-
-        val modelTopology = jsonObject.getJSONObject("model_topology")
-        this.presyn_neurons = modelTopology.optInt("input_size", this.presyn_neurons)
-        this.postsyn_neurons = modelTopology.optInt("hidden_size", this.postsyn_neurons)
-        this.outputNeur = modelTopology.optInt("output_size", this.outputNeur)
-        val lifNeurons = jsonObject.getJSONObject("LIF_neurons").getJSONObject("lif1")
-        this.threshold = lifNeurons.optInt("threshold", this.threshold)
-        this.leakage = lifNeurons.optInt("leakage", this.leakage)
-
-        val nnTypeStr = jsonObject.optString("nn_type", "SFNN")
-        this.nnType = NEURAL_NETWORK_TYPE.valueOf(nnTypeStr)
-    }
-
-    fun getArchitectureInfo(): String {
-        return "$name: (NN Type: $nnType, Presynaptic Neurons = $presyn_neurons, Postsynaptic Neurons = $postsyn_neurons)"
-    }
-}
-
-
+//var layers: Int = 2
+//
+//enum class NEURAL_NETWORK_TYPE {
+//    SFNN, SCNN
+//}
+//
+//open class SnnArch(
+//    var name: String = "Default Name",
+//    var nnType: NEURAL_NETWORK_TYPE = NEURAL_NETWORK_TYPE.SFNN,
+//    var presyn_neurons: Int = 16,
+//    var postsyn_neurons: Int = 16,
+//    var outputNeur: Int = 10,
+//    var weightWidth: Int = 8,
+//    var potentialWidth: Int = 10,
+//    var leakage: Int = 1,
+//    var threshold: Int = 1,
+//    var reset: Int = 0,
+//    var spike_width: Int = 4,
+//) {
+//    fun loadModelFromJson(jsonFilePath: String) {
+//        val jsonString = File(jsonFilePath).readText()
+//
+//        val jsonObject = JSONObject(jsonString)
+//
+//        val modelTopology = jsonObject.getJSONObject("model_topology")
+//        this.presyn_neurons = modelTopology.optInt("input_size", this.presyn_neurons)
+//        this.postsyn_neurons = modelTopology.optInt("hidden_size", this.postsyn_neurons)
+//        this.outputNeur = modelTopology.optInt("output_size", this.outputNeur)
+//        val lifNeurons = jsonObject.getJSONObject("LIF_neurons").getJSONObject("lif1")
+//        this.threshold = lifNeurons.optInt("threshold", this.threshold)
+//        this.leakage = lifNeurons.optInt("leakage", this.leakage)
+//
+//        val nnTypeStr = jsonObject.optString("nn_type", "SFNN")
+//        this.nnType = NEURAL_NETWORK_TYPE.valueOf(nnTypeStr)
+//    }
+//
+//    fun getArchitectureInfo(): String {
+//        return "$name: (NN Type: $nnType, Presynaptic Neurons = $presyn_neurons, Postsynaptic Neurons = $postsyn_neurons)"
+//    }
+//}
+//
+//
 

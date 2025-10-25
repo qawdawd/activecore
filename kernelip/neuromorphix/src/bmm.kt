@@ -5,6 +5,8 @@ import hwast.hw_imm
 import hwast.hw_var
 import hwast.*
 import cyclix.*
+import neuromorphix.NmMath
+
 
 
 // ===== TickGen: конфиг + компонент =====
@@ -92,13 +94,7 @@ data class FifoInIF(
     val rd_credit_o: hw_var   // локал:  доступный размер чтения «пассивного» банка
 )
 
-private fun log2ceil(v: Int): Int {
-    require(v > 0)
-    var n = v - 1
-    var r = 0
-    while (n > 0) { n = n shr 1; r++ }
-    return maxOf(r, 1)
-}
+
 
 class FifoInput(private val instName: String = "in_fifo") {
 
@@ -110,7 +106,7 @@ class FifoInput(private val instName: String = "in_fifo") {
         val name = cfg.name
 
         // ширины
-        val ptrW = log2ceil(cfg.depth)
+        val ptrW = NmMath.log2ceil(cfg.depth)
 
         // ===== Внешние порты записи =====
         val wr_i      = g.uport("wr_$name", PORT_DIR.IN,  hw_dim_static(1),        "0")
@@ -264,8 +260,8 @@ data class FifoOutIF(
 
 class FifoOutput(private val instName: String = "out_fifo") {
 
-    // если у тебя уже есть log2ceil — используй его
-    private fun log2ceil(x: Int): Int {
+    // если у тебя уже есть NmMath.log2ceil — используй его
+    private fun NmMath.log2ceil(x: Int): Int {
         require(x > 0) { "x must be > 0" }
         var v = x - 1
         var r = 0
@@ -279,7 +275,7 @@ class FifoOutput(private val instName: String = "out_fifo") {
         tick: hw_var
     ): FifoOutIF {
         val name = cfg.name
-        val ptrW = log2ceil(cfg.depth)
+        val ptrW = NmMath.log2ceil(cfg.depth)
 
         // ===== ВНЕШНИЕ ПОРТЫ ЧТЕНИЯ =====
         val rd_i      = g.uport("rd_$name",       PORT_DIR.IN,  hw_dim_static(1),             "0")
@@ -445,10 +441,10 @@ class DynamicParamMem(private val instName: String = "dynp") {
         val mem    = g.uglobal("mem_$name", memDim, if (cfg.initZero) "0" else "undef")
 
         // --- Интерфейсные сигналы
-        val rd_idx   = g.uglobal("rd_idx_$name",   hw_dim_static(log2ceil(cfg.count)), "0")
+        val rd_idx   = g.uglobal("rd_idx_$name",   hw_dim_static(NmMath.log2ceil(cfg.count)), "0")
         val rd_data  = g.uglobal("rd_data_$name",  hw_dim_static(cfg.bitWidth),        "0")
 
-        val wr_idx   = g.uglobal("wr_idx_$name",   hw_dim_static(log2ceil(cfg.count)), "0")
+        val wr_idx   = g.uglobal("wr_idx_$name",   hw_dim_static(NmMath.log2ceil(cfg.count)), "0")
         val wr_data  = g.uglobal("wr_data_$name",  hw_dim_static(cfg.bitWidth),        "0")
         val we       = g.uglobal("we_$name",       hw_dim_static(1),                   "0")
 
@@ -513,7 +509,7 @@ class StaticMemIfGen(private val instName: String = "wmem_if") {
         val name = cfg.name
 
         // --- адресная ширина
-        val addrW = log2ceil(cfg.depth)
+        val addrW = NmMath.log2ceil(cfg.depth)
 
         // --- внешние порты: адрес и данные
         val adr_o = g.uport("adr_${name}", PORT_DIR.OUT, hw_dim_static(addrW), "0")
@@ -579,7 +575,7 @@ data class TopologySpec(
 
 // ===== рантайм-регистры/параметры, приходящие "снаружи" =====
 // Здесь мы НЕ создаём регистры — просто принимаем ссылки на уже созданные hw_var
-data class RuntimeRegIf(
+data class RegIf(
     val postsynCount: hw_var,     // реальное число постсинаптических нейронов для обхода
     val baseAddr:     hw_var? = null // опционально: базовый адрес в памяти весов
 )
@@ -621,7 +617,7 @@ class SynapseSelector(private val instName: String = "syn_sel") {
 
     /**
      * Генерация селектора:
-     * - принимает TopologySpec, RuntimeRegIf, tick (опц.), интерфейс статической памяти (StaticMemIf)
+     * - принимает TopologySpec, RegIf, tick (опц.), интерфейс статической памяти (StaticMemIf)
      * - создаёт простую FSM: IDLE→RUN→(DONE)
      * - в RUN перебирает postIdx от 0 до (postsynCount-1), выдаёт адрес в memIf.adr_r и ставит memIf.en_r=1
      */
@@ -629,7 +625,7 @@ class SynapseSelector(private val instName: String = "syn_sel") {
         g: Generic,
         cfg: SynSelCfg,
         topo: TopologySpec,
-        rt: RuntimeRegIf,
+        rt: RegIf,
         tick: hw_var?,                     // если cfg.stepByTick=true — используем этот тик
         mem: StaticMemIF                   // интерфейс к памяти (адрес/вкл/данные)
     ): SynSelIF {
