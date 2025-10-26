@@ -273,15 +273,12 @@ fun dumpFsm(fsm: FsmPlan) {
     }
 }
 
-
-
 fun main() {
     // 0) Архитектура
     val arch = SnnArch(
         modelName = "LIF_demo",
         nnType    = NeuralNetworkType.SFNN,
         dims      = NnDims(presynCount = 28*28, postsynCount = 128)
-        // neuron/numeric возьмутся по умолчанию из SnnArch, если они у тебя есть
     )
 
     // 1) Транзакции
@@ -289,20 +286,17 @@ fun main() {
         addField("w",     16, SpikeFieldKind.SYNAPTIC_PARAM)
         addField("delay", 8,  SpikeFieldKind.DELAY)
         addField("tag",   8,  SpikeFieldKind.SYNAPTIC_PARAM)
-
         opAddExt(
             dstNeuronName = "Vmemb",
             a = SpikeOperand.neuronField("Vmemb"),
             b = SpikeOperand.field("w")
         )
     }
-
     val neuron = NeuronTx().apply {
         addField("Vmemb",   16, NeuronFieldKind.DYNAMIC)
         addField("Vthr",    16, NeuronFieldKind.STATIC)
         addField("Vrst",    16, NeuronFieldKind.STATIC)
         addField("leakage", 16, NeuronFieldKind.STATIC)
-
         opShrImm(dst = "Vmemb", aField = "Vmemb", shift = 1)
         val cond = ifGe("Vmemb", "Vthr")
         opEmitIf(cond, resetDst = "Vmemb", resetImm = 0)
@@ -315,92 +309,95 @@ fun main() {
     // 3) Symbols
     val symbols = buildSymbols(arch, spike, neuron)
 
-    // Общий отладочный вывод
+    // Отладка
     println(arch.info())
     println("SPIKE fields: ${symbols.spikeFields.keys}")
     println("NEURON fields: ${symbols.neuronFields.keys}")
     println("==== TxIR dump ===="); ir.dump()
     println("==== AST dump ===="); ast.dump()
 
-    // Подготовим список синпараметров для анализатора
+    // Список синаптических полей
     val synParams = symbols.spikeFields.values
         .filter { it.kind == SpikeFieldKind.SYNAPTIC_PARAM }
         .sortedBy { it.name }
 
-    // === РЕЖИМ 1: PACKED ===
-    run {
-        val packAllSynParams = true
-        val insights = TxAnalyzer.analyze(
-            arch = arch,
-            symbols = symbols,
-            ir = ir,
-            packAllSynParams = packAllSynParams,
-            synParams = synParams
-        )
-
-        val layout = buildLayoutPlan(
-            arch = arch,
-            symbols = symbols,
-            ir = ir,
-            packAllSynParams = packAllSynParams
-        )
-
-        val bind = TxBinder.buildBindPlan(
-            ir = ir,
-            symbols = symbols,
-            layout = layout,
-            insights = insights
-        )
-
-        println("\n==== LayoutPlan (PACKED) ====")
-        dumpLayout(layout)
-
-        println("\n---- BindPlan (PACKED) ----")
-        dumpBind(bind)
-    }
-
-    // === РЕЖИМ 2: SEPARATE MEMS ===
-    run {
-        val packAllSynParams = false
-        val insights = TxAnalyzer.analyze(
-            arch = arch,
-            symbols = symbols,
-            ir = ir,
-            packAllSynParams = packAllSynParams,
-            synParams = synParams
-        )
-
-        val layout = buildLayoutPlan(
-            arch = arch,
-            symbols = symbols,
-            ir = ir,
-            packAllSynParams = packAllSynParams
-        )
-
-        val bind = TxBinder.buildBindPlan(
-            ir = ir,
-            symbols = symbols,
-            layout = layout,
-            insights = insights
-        )
-
-        println("\n==== LayoutPlan (SEPARATE MEMS) ====")
-        dumpLayout(layout)
-
-        println("\n---- BindPlan (SEPARATE MEMS) ----")
-        dumpBind(bind)
-
-        val fsm = FsmPlanner.build(layout, bind)
-        println("\n---- FsmPlan ----")
-        dumpFsm(fsm)
-
-        val names = NamingPlanner.assign(layout, bind, naming = Naming(
-            // можно переопределить префиксы под конкретное ядро/иерархию
+    // ---------- PACKED ----------
+    val insightsPacked = TxAnalyzer.analyze(
+        arch = arch, symbols = symbols, ir = ir,
+        packAllSynParams = true, synParams = synParams
+    )
+    val layoutPacked = buildLayoutPlan(
+        arch = arch, symbols = symbols, ir = ir, packAllSynParams = true
+    )
+    val bindPacked = TxBinder.buildBindPlan(
+        ir = ir, symbols = symbols, layout = layoutPacked, insights = insightsPacked
+    )
+    val fsmPlanPacked = FsmPlanner.build(layoutPacked, bindPacked)
+    val namingPacked = NamingPlanner.assign(
+        layoutPacked, bindPacked,
+        naming = Naming(
+            tickName = "tick",
             regPrefix = "cfg_lif0",
             fsmName   = "lif0_fsm"
-        ))
-        println("\n---- Naming ----")
-        dumpNamingNames(names)
+        )
+    )
 
-    }
+    println("\n==== LayoutPlan (PACKED) ====");  dumpLayout(layoutPacked)
+    println("\n---- BindPlan (PACKED) ----");    dumpBind(bindPacked)
+    println("\n---- FsmPlan (PACKED) ----");     dumpFsm(fsmPlanPacked)
+    println("\n---- Naming (PACKED) ----");      dumpNamingNames(namingPacked)
+
+//    // ---------- SEPARATE (опционально) ----------
+//    val insightsSeparate = TxAnalyzer.analyze(
+//        arch = arch, symbols = symbols, ir = ir,
+//        packAllSynParams = false, synParams = synParams
+//    )
+//    val layoutSeparate = buildLayoutPlan(
+//        arch = arch, symbols = symbols, ir = ir, packAllSynParams = false
+//    )
+//    val bindSeparate = TxBinder.buildBindPlan(
+//        ir = ir, symbols = symbols, layout = layoutSeparate, insights = insightsSeparate
+//    )
+//    val fsmPlanSeparate = FsmPlanner.build(layoutSeparate, bindSeparate)
+//    val namingSeparate = NamingPlanner.assign(
+//        layoutSeparate, bindSeparate,
+//        naming = Naming(
+//            tickName = "tick",
+//            regPrefix = "cfg_lif1",
+//            fsmName   = "lif1_fsm"
+//        )
+//    )
+
+//    println("\n==== LayoutPlan (SEPARATE MEMS) ===="); dumpLayout(layoutSeparate)
+//    println("\n---- BindPlan (SEPARATE MEMS) ----");   dumpBind(bindSeparate)
+//    println("\n---- FsmPlan (SEPARATE) ----");         dumpFsm(fsmPlanSeparate)
+//    println("\n---- Naming (SEPARATE) ----");          dumpNamingNames(namingSeparate)
+
+    // ---------- Генерация HDL для PACKED ----------
+    val g = cyclix.Generic("nm_core_top")
+
+    val handlesPacked = CoreAssembler.buildCore(
+        g       = g,
+        arch    = arch,
+        layout  = layoutPacked,
+        bind    = bindPacked,
+        fsmPlan = fsmPlanPacked,
+        // Важно: NamingPlanner.assign() возвращает AssignedNames; CoreAssembler ожидает Naming.
+        // Используй базовое поле (например, .base или .naming — как у тебя названо).
+        naming  = namingPacked.naming
+    )
+
+    val moduleName = "neuromorphic_core"
+    val outDir = "SystemVerilog"
+    println("Starting $moduleName hardware generation")
+    val rtl = g.export_to_rtl(DEBUG_LEVEL.FULL)
+    rtl.export_to_sv("$outDir/$moduleName", DEBUG_LEVEL.FULL)
+    println("Done. RTL at $outDir/$moduleName")
+
+    println("Core assembled. Dyn main = ${handlesPacked.dynMain.mem.name}, FIFO out = ${handlesPacked.fifoOut.rd_data_o.name}")
+
+    // ---------- Если нужно — сборка SEPARATE ----------
+    // val handlesSeparate = CoreAssembler.buildCore(
+    //     g, arch, layoutSeparate, bindSeparate, fsmPlanSeparate, namingSeparate.base
+    // )
 }

@@ -3,6 +3,7 @@ package neuromorphix
 
 /** Базовые соглашения по именам. Все низкоуровневые имена строим из них. */
 data class Naming(
+    val tickName: String = "tick",
     val fifoInName:  String = "spike_in",
     val fifoOutName: String = "spike_out",
     val wmemName:    String = "w_l1",
@@ -51,6 +52,7 @@ class NameScope {
 /** Результат назначений имён (инстансы и ключевые сигналы/регистры). */
 data class AssignedNames(
     // инстансы
+    val naming: Naming,                     // ← добавь это поле
     val tickInst: String,
     val fifoInInst: String,
     val fifoOutInst: String,
@@ -133,6 +135,7 @@ object NamingPlanner {
         }
 
         return AssignedNames(
+            naming = naming,   // ← сохраняем исходный Naming
             tickInst = tickInst,
             fifoInInst = fifoInInst,
             fifoOutInst = fifoOutInst,
