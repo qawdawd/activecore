@@ -49,10 +49,10 @@ data class BindingCtx(
 //interface LayoutPlan
 
 // Правила биндинга IR → интерфейсы компонентов (маршрутизация операций по фазам/компонентам)
-interface BindPlan
+//interface BindPlan
 
 // План FSM: список состояний, сигналы стартов/гейтов/ожиданий
-interface FsmPlan
+//interface FsmPlan
 
 // Единый формат проверок (валидация ширин, глубин, адресаций, наличия регистров и т.п.)
 data class Check(
@@ -62,16 +62,16 @@ data class Check(
 )
 
 // Соглашения по именованию инстансов/сигналов для стабильной генерации
-data class Naming(
-    val fifoInName: String = "spike_in",
-    val fifoOutName: String = "spike_out",
-    val wmemName: String = "w_l1",
-    val vmemName: String = "Vmemb",
-    val regPrefix: String = "cfg",
-    val fsmName: String = "core_fsm",
-    val selectorName: String = "sel0",
-    val synName: String = "syn",
-    val neurName: String = "neur",
-    val emitName: String = "emit",
-    val tickName: String = "tick"
-)
+//data class Naming(
+//    val fifoInName: String = "spike_in",
+//    val fifoOutName: String = "spike_out",
+//    val wmemName: String = "w_l1",
+//    val vmemName: String = "Vmemb",
+//    val regPrefix: String = "cfg",
+//    val fsmName: String = "core_fsm",
+//    val selectorName: String = "sel0",
+//    val synName: String = "syn",
+//    val neurName: String = "neur",
+//    val emitName: String = "emit",
+//    val tickName: String = "tick"
+//)

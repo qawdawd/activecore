@@ -179,65 +179,6 @@ import neuromorphix.*
 //}
 
 
-fun main() {
-    // 0) Архитектура
-    val arch = SnnArch(
-        modelName = "LIF_demo",
-        nnType    = NeuralNetworkType.SFNN,
-        dims      = NnDims(presynCount = 28*28, postsynCount = 128),
-//        neuron    = NeuronParams(threshold = 1, reset = 0, leakage = 1),
-//        numeric   = NumericLayout(weightWidth = 16, potentialWidth = 16)
-    )
-
-    // 1) Твои транзакции — БЕЗ изменений
-    val spike = SpikeTx().apply {
-        addField("w",     16, SpikeFieldKind.SYNAPTIC_PARAM)
-        addField("delay", 8,  SpikeFieldKind.DELAY)
-        addField("tag",   8,  SpikeFieldKind.SYNAPTIC_PARAM)
-
-        opAddExt(
-            dstNeuronName = "Vmemb",
-            a = SpikeOperand.neuronField("Vmemb"),
-            b = SpikeOperand.field("w")
-        )
-    }
-
-    val neuron = NeuronTx().apply {
-        addField("Vmemb", 16, NeuronFieldKind.DYNAMIC)
-        addField("Vthr",  16, NeuronFieldKind.STATIC)
-        addField("Vrst",  16, NeuronFieldKind.STATIC)
-        addField("leakage", 16, NeuronFieldKind.STATIC)
-
-        opShrImm(dst = "Vmemb", aField = "Vmemb", shift = 1)
-        val cond = ifGe("Vmemb", "Vthr")
-        opEmitIf(cond, resetDst = "Vmemb", resetImm = 0)
-    }
-
-    // 2) IR/AST
-    val ir  = buildTxIR(spike, neuron)
-    val ast = buildAst(spike, neuron, name = "lif_ast")
-
-    // 3) Symbols
-    val symbols = buildSymbols(arch, spike, neuron)
-
-    // 4) LayoutPlan (попробуй и pack=true, и pack=false)
-    val layoutPacked   = buildLayoutPlan(arch, symbols, ir, packAllSynParams = true)
-    val layoutSeparate = buildLayoutPlan(arch, symbols, ir, packAllSynParams = false)
-
-    // — отладочный вывод —
-    println(arch.info())
-    println("SPIKE fields: ${symbols.spikeFields.keys}")
-    println("NEURON fields: ${symbols.neuronFields.keys}")
-    println("==== TxIR dump ===="); ir.dump()
-    println("==== AST dump ===="); ast.dump()
-
-    println("\n==== LayoutPlan (PACKED) ====")
-    dumpLayout(layoutPacked)
-
-    println("\n==== LayoutPlan (SEPARATE MEMS) ====")
-    dumpLayout(layoutSeparate)
-}
-
 /** Красивый дамп LayoutPlan с учётом множества wmem и возможной упаковки. */
 fun dumpLayout(layout: LayoutPlan) {
     println("tick: ${layout.tick.signalName}  ${layout.tick.cfg}")
@@ -246,7 +187,10 @@ fun dumpLayout(layout: LayoutPlan) {
 
     // wmems: ключ — имя синаптического поля (например, "w", "tag")
     println("wmems:")
-    layout.wmems.forEach { (field, plan) ->
+    // во избежание неоднозначности forEach с деструктуризацией — через entry
+    layout.wmems.forEach { entry ->
+        val field = entry.key
+        val plan  = entry.value
         val cfg = plan.cfg
         val packInfo = plan.pack?.let { pack ->
             val slices = pack.fields.entries.joinToString { (fname, sl) -> "$fname[${sl.msb}:${sl.lsb}]" }
@@ -277,4 +221,186 @@ fun dumpLayout(layout: LayoutPlan) {
     println("phases.neur.ops: ${layout.phases.neur.ops}  postsynCountRegKey=${layout.phases.neur.postsynCountRegKey}")
     println("phases.emit: ${layout.phases.emit}")
     println("topology: ${layout.topology}")
+}
+
+/** Красивый дамп BindPlan (под актуальные типы правил). */
+fun dumpBind(bind: BindPlan) {
+    println("phaseOrder: ${bind.phaseOrder.joinToString()}")
+
+    // synRules
+    if (bind.synRules.isEmpty()) {
+        println("synRules: (none)")
+    } else {
+        println("synRules:")
+        bind.synRules.forEachIndexed { i, r ->
+            println("  [$i] ir#${r.irIndex}  ${r.opcode}  synParam='${r.synParamField}'  -> dyn='${r.dynField}'")
+        }
+    }
+
+    // neurRules
+    if (bind.neurRules.isEmpty()) {
+        println("neurRules: (none)")
+    } else {
+        println("neurRules:")
+        bind.neurRules.forEachIndexed { i, r ->
+            val reg = r.regKey ?: "-"
+            println("  [$i] ir#${r.irIndex}  ${r.opcode}  dst='${r.dstDynField}'  via regKey='$reg'")
+        }
+    }
+
+    // emitRule
+    println(
+        "emitRule: cmp=${bind.emitRule.cmp}, " +
+                "cmpRegKey=${bind.emitRule.cmpRegKey}, " +
+                "refractory=${bind.emitRule.refractory}, " +
+                "resetRegKey=${bind.emitRule.resetRegKey}"
+    )
+}
+
+fun dumpFsm(fsm: FsmPlan) {
+    println("fsm.states: ${fsm.states.joinToString()}")
+    if (fsm.gates.isEmpty()) println("fsm.gates: (none)") else {
+        println("fsm.gates:")
+        fsm.gates.forEach { (k, v) -> println("  $k -> $v") }
+    }
+    if (fsm.starts.isEmpty()) println("fsm.starts: (none)") else {
+        println("fsm.starts:")
+        fsm.starts.forEach { (k, v) -> println("  $k -> $v") }
+    }
+    if (fsm.waits.isEmpty()) println("fsm.waits: (none)") else {
+        println("fsm.waits:")
+        fsm.waits.forEach { (state, doneSig) -> println("  $state : wait $doneSig") }
+    }
+}
+
+
+
+fun main() {
+    // 0) Архитектура
+    val arch = SnnArch(
+        modelName = "LIF_demo",
+        nnType    = NeuralNetworkType.SFNN,
+        dims      = NnDims(presynCount = 28*28, postsynCount = 128)
+        // neuron/numeric возьмутся по умолчанию из SnnArch, если они у тебя есть
+    )
+
+    // 1) Транзакции
+    val spike = SpikeTx().apply {
+        addField("w",     16, SpikeFieldKind.SYNAPTIC_PARAM)
+        addField("delay", 8,  SpikeFieldKind.DELAY)
+        addField("tag",   8,  SpikeFieldKind.SYNAPTIC_PARAM)
+
+        opAddExt(
+            dstNeuronName = "Vmemb",
+            a = SpikeOperand.neuronField("Vmemb"),
+            b = SpikeOperand.field("w")
+        )
+    }
+
+    val neuron = NeuronTx().apply {
+        addField("Vmemb",   16, NeuronFieldKind.DYNAMIC)
+        addField("Vthr",    16, NeuronFieldKind.STATIC)
+        addField("Vrst",    16, NeuronFieldKind.STATIC)
+        addField("leakage", 16, NeuronFieldKind.STATIC)
+
+        opShrImm(dst = "Vmemb", aField = "Vmemb", shift = 1)
+        val cond = ifGe("Vmemb", "Vthr")
+        opEmitIf(cond, resetDst = "Vmemb", resetImm = 0)
+    }
+
+    // 2) IR/AST
+    val ir  = buildTxIR(spike, neuron)
+    val ast = buildAst(spike, neuron, name = "lif_ast")
+
+    // 3) Symbols
+    val symbols = buildSymbols(arch, spike, neuron)
+
+    // Общий отладочный вывод
+    println(arch.info())
+    println("SPIKE fields: ${symbols.spikeFields.keys}")
+    println("NEURON fields: ${symbols.neuronFields.keys}")
+    println("==== TxIR dump ===="); ir.dump()
+    println("==== AST dump ===="); ast.dump()
+
+    // Подготовим список синпараметров для анализатора
+    val synParams = symbols.spikeFields.values
+        .filter { it.kind == SpikeFieldKind.SYNAPTIC_PARAM }
+        .sortedBy { it.name }
+
+    // === РЕЖИМ 1: PACKED ===
+    run {
+        val packAllSynParams = true
+        val insights = TxAnalyzer.analyze(
+            arch = arch,
+            symbols = symbols,
+            ir = ir,
+            packAllSynParams = packAllSynParams,
+            synParams = synParams
+        )
+
+        val layout = buildLayoutPlan(
+            arch = arch,
+            symbols = symbols,
+            ir = ir,
+            packAllSynParams = packAllSynParams
+        )
+
+        val bind = TxBinder.buildBindPlan(
+            ir = ir,
+            symbols = symbols,
+            layout = layout,
+            insights = insights
+        )
+
+        println("\n==== LayoutPlan (PACKED) ====")
+        dumpLayout(layout)
+
+        println("\n---- BindPlan (PACKED) ----")
+        dumpBind(bind)
+    }
+
+    // === РЕЖИМ 2: SEPARATE MEMS ===
+    run {
+        val packAllSynParams = false
+        val insights = TxAnalyzer.analyze(
+            arch = arch,
+            symbols = symbols,
+            ir = ir,
+            packAllSynParams = packAllSynParams,
+            synParams = synParams
+        )
+
+        val layout = buildLayoutPlan(
+            arch = arch,
+            symbols = symbols,
+            ir = ir,
+            packAllSynParams = packAllSynParams
+        )
+
+        val bind = TxBinder.buildBindPlan(
+            ir = ir,
+            symbols = symbols,
+            layout = layout,
+            insights = insights
+        )
+
+        println("\n==== LayoutPlan (SEPARATE MEMS) ====")
+        dumpLayout(layout)
+
+        println("\n---- BindPlan (SEPARATE MEMS) ----")
+        dumpBind(bind)
+
+        val fsm = FsmPlanner.build(layout, bind)
+        println("\n---- FsmPlan ----")
+        dumpFsm(fsm)
+
+        val names = NamingPlanner.assign(layout, bind, naming = Naming(
+            // можно переопределить префиксы под конкретное ядро/иерархию
+            regPrefix = "cfg_lif0",
+            fsmName   = "lif0_fsm"
+        ))
+        println("\n---- Naming ----")
+        dumpNamingNames(names)
+
+    }
 }
