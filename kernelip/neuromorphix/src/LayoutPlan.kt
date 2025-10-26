@@ -120,6 +120,7 @@ data class SynPhasePlan(
 fun buildSynPack(synParams: List<SpikeFieldDesc>): SynPackPlan {
     require(synParams.isNotEmpty()) { "buildSynPack: empty synParams" }
 
+
     // фиксируем детерминированный порядок упаковки
     val ordered = synParams.sortedBy { it.name }
 
@@ -186,84 +187,6 @@ private fun buildRegBankFromSymbols(
     return RegBankPlan(regs = regs, mapApiKeys = mapApi)
 }
 
-
-private data class EmitDerivation(
-    val cmp: CmpKind,
-    val cmpRegKey: String,
-    val refractory: Boolean,
-    val resetRegKey: String?,
-    val extraRegs: List<RegDesc>     // синтезированные константные регистры
-)
-
-/** Извлекаем EMIT_IF из IR и строим биндинг к RegBank. */
-private fun deriveEmitFromIr(
-    arch: SnnArch,
-    symbols: Symbols,
-    ir: TxIR?
-): EmitDerivation {
-    val emit = ir?.ops?.firstOrNull { it.phase == TxPhase.NEURONAL && it.opcode == TxOpcode.EMIT_IF }
-        ?: return EmitDerivation(
-            cmp = CmpKind.GE,
-            cmpRegKey = symbols.neuronFields.keys.firstOrNull() ?: "Vthr",
-            refractory = false,
-            resetRegKey = null,
-            extraRegs = emptyList()
-        )
-
-    // 1) cmp kind
-    val cmpKind = when (emit.cmp ?: NeuronCmp.GE) {
-        NeuronCmp.GT -> CmpKind.GT
-        NeuronCmp.LT -> CmpKind.LT
-        NeuronCmp.GE -> CmpKind.GE
-        NeuronCmp.LE -> CmpKind.LE
-        // EQ/NE пока мапим на GE как заглушку (или расширяй SpikeEmitter под EQ/NE)
-        NeuronCmp.EQ, NeuronCmp.NE -> CmpKind.GE
-    }
-
-    val extra = mutableListOf<RegDesc>()
-
-    // 2) правый операнд сравнения (emit.b) — ИМЯ или ИММ
-    val b = emit.b ?: error("EMIT_IF: right operand (b) is null")
-    val cmpRegKey = if (!b.isImm) {
-        b.name ?: error("EMIT_IF: right operand has no name")
-    } else {
-        val imm = b.imm ?: error("EMIT_IF: immediate 'b.imm' is null")
-        val name = "cmpImm_$imm"
-        extra += RegDesc(name = name, width = arch.d.potentialW, init = imm.toString())
-        name
-    }
-
-    // 3) reset (рефрактер)
-    var refractory = false
-    var resetRegKey: String? = null
-
-    if (emit.resetDst != null || emit.resetImm != null) {
-        refractory = true
-        if (emit.resetImm != null) {
-            val imm = emit.resetImm!!
-            // если есть статический Vrst и совпадает семантика — можем использовать его
-            if ("Vrst" in symbols.neuronFields && imm == 0) {
-                resetRegKey = "Vrst"
-            } else {
-                val name = "rstImm_$imm"
-                extra += RegDesc(name = name, width = arch.d.potentialW, init = imm.toString())
-                resetRegKey = name
-            }
-        } else {
-            // сброс в значение из регистра/поля
-            resetRegKey = emit.resetDst
-        }
-    }
-
-    return EmitDerivation(
-        cmp = cmpKind,
-        cmpRegKey = cmpRegKey,
-        refractory = refractory,
-        resetRegKey = resetRegKey,
-        extraRegs = extra
-    )
-}
-
 /* ================================================================
  *  Построение DefaultLayoutPlan
  *  — статический план «что инстанцировать и как связать»
@@ -284,6 +207,14 @@ fun buildLayoutPlan(
         .filter { it.kind == SpikeFieldKind.SYNAPTIC_PARAM }
         .sortedBy { it.name }           // фиксируем порядок, чтобы упаковка была детерминированной
     require(synParams.isNotEmpty()) { "нет SPIKE полей SYNAPTIC_PARAM — нечего читать в синфазе" }
+
+    val insights = TxAnalyzer.analyze(
+        arch = arch,
+        symbols = symbols,
+        ir = ir,
+        packAllSynParams = packAllSynParams,
+        synParams = synParams
+    )
 
     val weightDepth = arch.dims.presynCount * arch.dims.postsynCount
 
@@ -315,30 +246,22 @@ fun buildLayoutPlan(
 
 // === 2) StaticMem: либо pack, либо по отдельности ===
     val wmems: Map<String, StaticMemPlan>
-    val packedPlan: StaticMemPlan?
-    val packedSlicesForSyn: SynPackPlan?   // <— добавим эту переменную
-
-    if (packAllSynParams) {
-        val pack = buildSynPack(synParams)     // <-- твоя функция упаковки
+    if (insights.synPack != null) {
         val mem = StaticMemPlan(
             role = "synparams_packed",
             cfg = StaticMemCfg(
                 name = "wmem_pack",
-                wordWidth = pack.wordWidth,
+                wordWidth = insights.synPack.wordWidth,
                 depth = weightDepth,
                 preIdxWidth = d.presynIdxW,
                 postIdxWidth = d.postsynIdxW,
                 postsynCount = arch.dims.postsynCount,
                 useEn = true
             ),
-            pack = pack
+            pack = insights.synPack
         )
-        wmems = synParams.associate { it.name to mem }
-        packedPlan = mem
-        packedSlicesForSyn = pack               // <— важно: прокидываем в план фаз
+        wmems = synParams.associate { it.name to mem }  // один IF на всё
     } else {
-        packedPlan = null
-        packedSlicesForSyn = null               // <— в раздельном режиме срезов нет
         wmems = synParams.associate { desc ->
             desc.name to StaticMemPlan(
                 role = "synparam:${desc.name}",
@@ -364,19 +287,15 @@ fun buildLayoutPlan(
     require(dynamicFields.isNotEmpty()) { "LayoutPlan: нет нейронных полей с kind=DYNAMIC" }
 
 // Попытка выбрать «главный» динамический массив из IR: dst в SYNAPTIC → SPACE_NEURON
-    val dynFromIr: String? = ir?.ops
-        ?.asSequence()
-        ?.filter { it.phase == TxPhase.SYNAPTIC && it.dstSpace == SPACE_NEURON }
-        ?.mapNotNull { it.dst }
-        ?.firstOrNull { dstName -> dynamicFields.any { it.name == dstName } }
+//    val dynFromIr: String? = ir?.ops
+//        ?.asSequence()
+//        ?.filter { it.phase == TxPhase.SYNAPTIC && it.dstSpace == SPACE_NEURON }
+//        ?.mapNotNull { it.dst }
+//        ?.firstOrNull { dstName -> dynamicFields.any { it.name == dstName } }
 
 // Политика выбора главного:
 // 1) по IR, 2) Vmemb, 3) первый динамический
-    val mainDynName = when {
-        dynFromIr != null -> dynFromIr
-        dynamicFields.any { it.name == "Vmemb" } -> "Vmemb"
-        else -> dynamicFields.first().name
-    }
+    val mainDynName = insights.mainDynamicName
 
     val allDynPlans = dynamicFields.map { nf ->
         DynParamPlan(
@@ -449,19 +368,19 @@ fun buildLayoutPlan(
         }?.distinct()?.singleOrNull() ?: SynOpKind.ADD
 
 // ... селектор и выбор preferred/synOp — как у тебя ...
-    val emitDer = deriveEmitFromIr(arch, symbols, ir)
+//    val emitDer = deriveEmitFromIr(arch, symbols, ir)
 
 // === ФАЗЫ (как у тебя сейчас) ===
     val phases = PhasePlans(
         syn = SynPhasePlan(
-            op = synOp,
+            op = insights.synOp,
             gateByTick = true,
-            synParamField = preferred,
-            packedSlices = packedSlicesForSyn,
+            synParamField = insights.synParamPreferred,
+            packedSlices = insights.synPack,
             connects = mapOf(
                 "inFifo"   to "spike_in",
                 "selector" to "sel0",
-                "dyn"      to mainDynName   // уже сделали динамику не жёстко «Vmemb»
+                "dyn"      to mainDynName
             )
         ),
         neur = NeurPhasePlan(
@@ -469,19 +388,22 @@ fun buildLayoutPlan(
             postsynCountRegKey = "postsynCount"
         ),
         emit = EmitPlan(
-            cmp         = emitDer.cmp,
-            cmpRegKey   = emitDer.cmpRegKey,    // напр. "Vthr" или "cmpImm_42"
-            refractory  = emitDer.refractory,
-            resetRegKey = emitDer.resetRegKey,   // напр. "Vrst" или "rstImm_0"
+            cmp         = insights.emitCmp,
+            cmpRegKey   = insights.emitCmpRegKey,
+            refractory  = insights.emitRefractory,
+            resetRegKey = insights.emitResetRegKey,
             outRole     = "spike_out"
         )
     )
 
 // === БАНК РЕГИСТРОВ: теперь строим из symbols + phases ===
     val regBank = buildRegBankFromSymbols(
-        arch, symbols, phases,
-        extraRegs = emitDer.extraRegs          // <<— важное добавление
+        arch = arch,
+        symbols = symbols,
+        phases = phases,
+        extraRegs = insights.extraRegs          // <— важно
     )
+
     return DefaultLayoutPlan(
         tick = tick,
         fifoIn = fifoIn,
