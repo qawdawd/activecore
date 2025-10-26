@@ -3,27 +3,21 @@ package neuromorphix
 import cyclix.Generic
 import hwast.*
 
-enum class SynOpKind { ADD, SUB, REPLACE /* при желании умножение, saturate и т.п. */ }
+enum class SynOpKind { ADD, SUB, REPLACE }
 
 data class SynPhaseCfg(
     val name: String,
     val op: SynOpKind = SynOpKind.ADD,
-    val preIdxWidth: Int   // разрядность индекса пресинаптического нейрона
+    val preIdxWidth: Int
 )
 
-/** Служебный интерфейс статусов обработчика (можно расширять) */
 data class SynPhaseIF(
-    val busy_o: hw_var,        // ядро занято обработкой спайка/синапсов
-    val done_o: hw_var,        // импульс: входная очередь опустела (фаза закончена)
-    val curPre_o: hw_var,      // текущий пресинаптический индекс (для отладки)
-    val curPost_o: hw_var      // текущий постсинаптический индекс (из селектора)
+    val busy_o: hw_var,
+    val done_o: hw_var,
+    val curPre_o: hw_var,
+    val curPost_o: hw_var
 )
 
-/**
- * Обработчик синаптической фазы.
- * Принимает ИНТЕРФЕЙСЫ уже созданных компонентов: входной FIFO, селектор, интерфейсы статической/динамической памяти
- * и (опционально) набор рантайм-регистров с postsynCount/baseAddr, если они требуются селектору.
- */
 class SynapticPhase(private val instName: String = "syn_phase") {
 
     fun emit(
@@ -39,26 +33,28 @@ class SynapticPhase(private val instName: String = "syn_phase") {
         // статическая память весов (dat_r = зарегистрированный выход из контроллера)
         wmem: StaticMemIF,
 
-        // динамические параметры пост-нейронов (например, мембранные потенциалы)
-        dyn: DynParamIF
+        // динамические параметры пост-нейронов
+        dyn: DynParamIF,
+
+        // ⬇️ опциональный «шлюз» от FSM (например, тик-окно). Если null — игнорируем.
+        gate: hw_var? = null
     ): SynPhaseIF {
 
         val name = cfg.name
 
         // === служебные регистры ===
-        val busy   = g.uglobal("${name}_busy",   hw_dim_static(1), "0")
-        val done   = g.uglobal("${name}_done",   hw_dim_static(1), "0")
-        val preLat = g.uglobal("${name}_pre", hw_dim_static(cfg.preIdxWidth), "0")
+        val busy   = g.uglobal("${name}_busy", hw_dim_static(1), "0")
+        val done   = g.uglobal("${name}_done", hw_dim_static(1), "0")
+        val preLat = g.uglobal("${name}_pre",  hw_dim_static(cfg.preIdxWidth), "0")
         val curPre = preLat
         val curPost= sel.postIdx_o
 
-        // внешним блокам (FSM) удобно видеть эти статусы
         val busy_o = busy
         val done_o = done
         val curPre_o  = curPre
         val curPost_o = curPost
 
-        // === FSM обработчика ===
+        // === FSM ===
         val S_IDLE     = 0
         val S_FETCH    = 1
         val S_STARTSEL = 2
@@ -70,67 +66,64 @@ class SynapticPhase(private val instName: String = "syn_phase") {
 
         // дефолты
         done.assign(0)
-        inFifo.rd_o.assign(0)          // чтение FIFO по стробу
-        sel.start_i.assign(0)          // старт селектора по импульсу
+        inFifo.rd_o.assign(0)
+        sel.start_i.assign(0)
 
-        // === IDLE: если FIFO не пуст, берём слово ===
+        // локальные условия
+        val fifoHasData = g.eq2(inFifo.empty_o, 0)
+        val gateOk = if (gate != null) g.eq2(gate, 1) else hw_imm(1)
+        val canStart = g.land(gateOk, fifoHasData)
+
+        // === IDLE ===
         g.begif(g.eq2(state, S_IDLE)); run {
             busy.assign(0)
 
-            g.begif(g.eq2(inFifo.empty_o, 0)); run {
-            inFifo.rd_o.assign(1)           // запросить чтение (1 такт)
+            g.begif(g.eq2(canStart, 1)); run {
+            // запросить чтение на один такт
+            inFifo.rd_o.assign(1)
             stateN.assign(S_FETCH)
         }; g.endif()
 
             g.begelse(); run {
-            // очередь пуста — фаза завершена
+            // очередь пуста (или gate закрыт) — сигнализируем завершение фазы
             done.assign(1)
         }; g.endif()
         }; g.endif()
 
-        // === FETCH: зафиксировать пресинаптический индекс, запустить селектор ===
+        // === FETCH: зафиксировать пресинапт. индекс и старт селектора ===
         g.begif(g.eq2(state, S_FETCH)); run {
             busy.assign(1)
-            // снимаем rd_o (импульс уже отдан), забираем данные
-            inFifo.rd_o.assign(0)
+            inFifo.rd_o.assign(0)               // снять импульс чтения
             preLat.assign(inFifo.rd_data_o)
 
-            // подаём пресинаптический индекс на селектор и стартуем его
             sel.preIdx_i.assign(inFifo.rd_data_o)
-            sel.start_i.assign(1)              // импульс старта
+            sel.start_i.assign(1)               // импульс старта
             stateN.assign(S_STARTSEL)
         }; g.endif()
 
-        // === STARTSEL: обнуляем start, переходим в RUN ===
+        // === STARTSEL: обнулить start, перейти в RUN ===
         g.begif(g.eq2(state, S_STARTSEL)); run {
             busy.assign(1)
-            sel.start_i.assign(0)              // убрать импульс
+            sel.start_i.assign(0)
             stateN.assign(S_RUN)
         }; g.endif()
 
-        // === RUN: на каждом шаге селектора выполняем операцию dyn[memIdx] (op) wmem.dat_r ===
+        // === RUN: на каждом шаге селектора выполняем операцию над dyn и wmem.dat_r ===
         g.begif(g.eq2(state, S_RUN)); run {
             busy.assign(1)
 
-            // адрес пост-нейрона = sel.postIdx_o
-            // 1) выставляем индекс чтения динамики (комбинационно читаем текущее значение)
             dyn.rd_idx.assign(sel.postIdx_o)
 
-            // 2) формируем новое значение по cfg.op
-            //    ВНИМАНИЕ: dyn.rd_data и wmem.dat_r – зарегистрированные сигналы;
-            //    при необходимости можно вставить пайплайн/латчи.
             val newVal = when (cfg.op) {
                 SynOpKind.ADD     -> dyn.rd_data.plus(wmem.dat_r)
                 SynOpKind.SUB     -> dyn.rd_data.minus(wmem.dat_r)
                 SynOpKind.REPLACE -> wmem.dat_r
             }
 
-            // 3) пишем обратно в ту же ячейку
             dyn.wr_idx.assign(sel.postIdx_o)
             dyn.wr_data.assign(newVal)
             dyn.we.assign(1)
 
-            // 4) если селектор закончил обход — снимаем we и возвращаемся в IDLE или берём следующий спайк
             g.begif(g.eq2(sel.done_o, 1)); run {
             dyn.we.assign(0)
             stateN.assign(S_IDLE)
