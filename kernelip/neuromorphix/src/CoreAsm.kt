@@ -45,11 +45,22 @@ object CoreAssembler {
         val fifoOut = FifoOutput(layout.fifoOut.cfg.name).emit(g, layout.fifoOut.cfg, tick)
 
         // 2) Статическая память(и) под синпараметры
-        //    (в pack-режиме все поля указывают на ОДИН и тот же IF; в separate — каждый своё)
-        val wmemIfs: Map<String, StaticMemIF> =
-            layout.wmems.mapValues { (_, plan) ->
-                StaticMemIfGen(plan.cfg.name).emit(g, plan.cfg)
+//    (в PACKED один физический инстанс для нескольких полей; в SEPARATE — по одному на поле)
+        val wmemIfByName = LinkedHashMap<String, StaticMemIF>()
+
+// Сначала создаём по одному StaticMemIF на КАЖДОЕ уникальное имя физической памяти
+        for (plan in layout.wmems.values) {
+            val physName = plan.cfg.name
+            if (!wmemIfByName.containsKey(physName)) {
+                val ifc = StaticMemIfGen(physName).emit(g, plan.cfg)
+                wmemIfByName[physName] = ifc
             }
+        }
+
+// Затем строим карту field -> StaticMemIF, отдавая один и тот же IF для всех полей,
+// которые указывают на один физический банк (избегает повторного добавления портов)
+        val wmemIfs: Map<String, StaticMemIF> =
+            layout.wmems.mapValues { (_, plan) -> wmemIfByName.getValue(plan.cfg.name) }
 
         // 3) Динамика: главный массив (Vmemb и т.п.)
         val dynMain = DynamicParamMem("dyn_${layout.dyn.main.field}")
