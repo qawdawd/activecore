@@ -389,6 +389,9 @@ class NeuronTx {
             }
         }
     }
+
+    fun listFieldsSnapshot(): List<NeuronField> = fields.toList()
+
 }
 
 

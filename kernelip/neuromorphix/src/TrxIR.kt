@@ -1,4 +1,4 @@
-import neuromorphix.*
+package neuromorphix
 
 // ===== IR: фазы/опкоды/операнды =====
 enum class TxPhase { SYNAPTIC, NEURONAL }
