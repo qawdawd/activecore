@@ -255,8 +255,12 @@ fun dumpLayout(layout: LayoutPlan) {
         println("  [$field] role=${plan.role}  name=${cfg.name}  depth=${cfg.depth}  $packInfo")
     }
 
-    println("dyn.main: ${layout.dyn.main}")
-    if (layout.dyn.extra.isNotEmpty()) println("dyn.extra: ${layout.dyn.extra}")
+    // ——— Динамические поля
+    println("dyn.main: ${layout.dyn.main}  (main)")
+    if (layout.dyn.extra.isNotEmpty()) {
+        println("dyn.extra: ${layout.dyn.extra.joinToString()}")
+    }
+    println("syn uses dyn='${layout.phases.syn.connects["dyn"]}'")
 
     println("regBank: ${layout.regBank.regs}")
     println("selector: ${layout.selector.cfg}")
@@ -272,5 +276,5 @@ fun dumpLayout(layout: LayoutPlan) {
 
     println("phases.neur.ops: ${layout.phases.neur.ops}  postsynCountRegKey=${layout.phases.neur.postsynCountRegKey}")
     println("phases.emit: ${layout.phases.emit}")
-        println("topology: ${layout.topology}")
+    println("topology: ${layout.topology}")
 }

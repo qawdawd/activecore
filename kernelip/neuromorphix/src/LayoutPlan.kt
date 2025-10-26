@@ -133,80 +133,136 @@ fun buildSynPack(synParams: List<SpikeFieldDesc>): SynPackPlan {
     }
     return SynPackPlan(wordWidth = offset, fields = map)
 }
-
 private fun buildRegBankFromSymbols(
     arch: SnnArch,
     symbols: Symbols,
-    phases: PhasePlans
+    phases: PhasePlans,
+    extraRegs: List<RegDesc> = emptyList()   // <-- НОВОЕ
 ): RegBankPlan {
     val regs = mutableListOf<RegDesc>()
 
-    // 1) Берём только CONFIG-поля нейрона: STATIC (+ опц. REFRACTORY). Без EMIT_PREDICATE!
+    // 1) CONFIG-поля нейрона: STATIC + (опц.) REFRACTORY
     symbols.neuronFields.values
         .filter { it.kind == NeuronFieldKind.STATIC || it.kind == NeuronFieldKind.REFRACTORY }
         .forEach { nf ->
             regs += RegDesc(name = nf.name, width = nf.width, init = "0")
         }
 
-    // 2) Служебные рантайм-регистры
+    // 2) Рантайм
     regs += RegDesc("postsynCount", arch.d.postsynIdxW, init = arch.dims.postsynCount.toString())
     regs += RegDesc("baseAddr",     arch.d.weightAddrW, init = "0")
 
-    // 3) Соберём alias-карту: логические ключи фаз → реальные имена регов, если они есть
-    val alias = mutableMapOf<String, String>().apply {
-        // threshold → Vthr (если такое STATIC-поле есть)
-        if ("Vthr" in symbols.neuronFields) this["threshold"] = "Vthr"
-        // reset → Vrst
-        if ("Vrst" in symbols.neuronFields) this["reset"] = "Vrst"
-        // leakage → либо leakage, либо Vleak (как договоришься в транзакции)
-        when {
-            "leakage" in symbols.neuronFields -> this["leakage"] = "leakage"
-            "Vleak"   in symbols.neuronFields -> this["leakage"] = "Vleak"
-        }
-    }
-
-    // 4) Какие ключи реально нужны фазам
+    // 3) Что реально требуют фазы (ключи — это уже ИСТИННЫЕ имена, пришедшие из IR/планов)
     val needed = buildSet {
         phases.neur.ops.mapNotNullTo(this) { it.regKey }
+        add(phases.neur.postsynCountRegKey)
         add(phases.emit.cmpRegKey)
         phases.emit.resetRegKey?.let { add(it) }
-        add(phases.neur.postsynCountRegKey)
     }
 
-    // 5) Не дублируем: если нужен логический ключ и есть alias → просто маппим,
-    // если нет ни alias, ни реального регистра — доcоздаём с безопасной шириной.
-    val haveNames = regs.map { it.name }.toMutableSet()
-    for (key in needed) {
-        val real = alias[key]
-        if (real != null) {
-            // alias указывает на уже существующий рег? (или появится в haveNames)
-            // ничего не добавляем, просто проложим mapApi ниже
-            continue
+    // 4) Добиваем недостающие (без дублей)
+    val have = regs.map { it.name }.toMutableSet()
+    for (k in needed) if (k !in have) {
+        val w = when (k) {
+            // если в symbols есть такие поля — возьмём их реальную ширину
+            in symbols.neuronFields -> symbols.neuronFields[k]!!.width
+            "postsynCount" -> arch.d.postsynIdxW
+            "baseAddr"     -> arch.d.weightAddrW
+            else            -> arch.d.potentialW   // безопасный дефолт
         }
-        if (key !in haveNames) {
-            val w = when (key) {
-                "threshold" -> maxOf(arch.d.thresholdW, arch.d.potentialW) // часто хотят порог той же ширины, что Vmemb
-                "reset"     -> maxOf(arch.d.resetW, arch.d.potentialW)
-                "leakage"   -> arch.d.leakageW
-                "postsynCount" -> arch.d.postsynIdxW
-                "baseAddr"     -> arch.d.weightAddrW
-                else -> arch.d.potentialW
-            }
-            regs += RegDesc(key, w, init = "0")
-            haveNames += key
-        }
+        regs += RegDesc(k, w, init = "0")
+        have += k
     }
 
-    // 6) mapApiKeys: тождественные + алиасы (логическое → реальное)
-    val mapApi = buildMap {
-        regs.forEach { putIfAbsent(it.name, it.name) }  // identity для всех реальных имён
-        alias.forEach { (logical, real) -> put(logical, real) }
+    // 5) Синтезированные «константные» регистры (cmpImm_*, rstImm_*)
+    for (r in extraRegs) if (r.name !in have) {
+        regs += r
+        have += r.name
     }
+
+    // 6) mapApiKeys: тождественная карта (никаких «threshold→Vthr» по умолчанию)
+    val mapApi = regs.associate { it.name to it.name }
 
     return RegBankPlan(regs = regs, mapApiKeys = mapApi)
 }
 
 
+private data class EmitDerivation(
+    val cmp: CmpKind,
+    val cmpRegKey: String,
+    val refractory: Boolean,
+    val resetRegKey: String?,
+    val extraRegs: List<RegDesc>     // синтезированные константные регистры
+)
+
+/** Извлекаем EMIT_IF из IR и строим биндинг к RegBank. */
+private fun deriveEmitFromIr(
+    arch: SnnArch,
+    symbols: Symbols,
+    ir: TxIR?
+): EmitDerivation {
+    val emit = ir?.ops?.firstOrNull { it.phase == TxPhase.NEURONAL && it.opcode == TxOpcode.EMIT_IF }
+        ?: return EmitDerivation(
+            cmp = CmpKind.GE,
+            cmpRegKey = symbols.neuronFields.keys.firstOrNull() ?: "Vthr",
+            refractory = false,
+            resetRegKey = null,
+            extraRegs = emptyList()
+        )
+
+    // 1) cmp kind
+    val cmpKind = when (emit.cmp ?: NeuronCmp.GE) {
+        NeuronCmp.GT -> CmpKind.GT
+        NeuronCmp.LT -> CmpKind.LT
+        NeuronCmp.GE -> CmpKind.GE
+        NeuronCmp.LE -> CmpKind.LE
+        // EQ/NE пока мапим на GE как заглушку (или расширяй SpikeEmitter под EQ/NE)
+        NeuronCmp.EQ, NeuronCmp.NE -> CmpKind.GE
+    }
+
+    val extra = mutableListOf<RegDesc>()
+
+    // 2) правый операнд сравнения (emit.b) — ИМЯ или ИММ
+    val b = emit.b ?: error("EMIT_IF: right operand (b) is null")
+    val cmpRegKey = if (!b.isImm) {
+        b.name ?: error("EMIT_IF: right operand has no name")
+    } else {
+        val imm = b.imm ?: error("EMIT_IF: immediate 'b.imm' is null")
+        val name = "cmpImm_$imm"
+        extra += RegDesc(name = name, width = arch.d.potentialW, init = imm.toString())
+        name
+    }
+
+    // 3) reset (рефрактер)
+    var refractory = false
+    var resetRegKey: String? = null
+
+    if (emit.resetDst != null || emit.resetImm != null) {
+        refractory = true
+        if (emit.resetImm != null) {
+            val imm = emit.resetImm!!
+            // если есть статический Vrst и совпадает семантика — можем использовать его
+            if ("Vrst" in symbols.neuronFields && imm == 0) {
+                resetRegKey = "Vrst"
+            } else {
+                val name = "rstImm_$imm"
+                extra += RegDesc(name = name, width = arch.d.potentialW, init = imm.toString())
+                resetRegKey = name
+            }
+        } else {
+            // сброс в значение из регистра/поля
+            resetRegKey = emit.resetDst
+        }
+    }
+
+    return EmitDerivation(
+        cmp = cmpKind,
+        cmpRegKey = cmpRegKey,
+        refractory = refractory,
+        resetRegKey = resetRegKey,
+        extraRegs = extra
+    )
+}
 
 /* ================================================================
  *  Построение DefaultLayoutPlan
@@ -301,21 +357,40 @@ fun buildLayoutPlan(
     }
 
 
-    // ——— 4) Динамика (главный массив — Vmemb)
-    // имя главного поля берём из Symbols (по умолчанию "Vmemb")
-    val vmembName = when {
-        "Vmemb" in symbols.neuronFields -> "Vmemb"
-        else -> symbols.neuronFields.keys.firstOrNull()
-            ?: error("LayoutPlan: нет ни одного нейронного поля для DynParam")
+// ——— 4) Динамика: все поля нейронной транзакции с kind = DYNAMIC
+    val dynamicFields = symbols.neuronFields.values
+        .filter { it.kind == NeuronFieldKind.DYNAMIC }
+        .toList()
+    require(dynamicFields.isNotEmpty()) { "LayoutPlan: нет нейронных полей с kind=DYNAMIC" }
+
+// Попытка выбрать «главный» динамический массив из IR: dst в SYNAPTIC → SPACE_NEURON
+    val dynFromIr: String? = ir?.ops
+        ?.asSequence()
+        ?.filter { it.phase == TxPhase.SYNAPTIC && it.dstSpace == SPACE_NEURON }
+        ?.mapNotNull { it.dst }
+        ?.firstOrNull { dstName -> dynamicFields.any { it.name == dstName } }
+
+// Политика выбора главного:
+// 1) по IR, 2) Vmemb, 3) первый динамический
+    val mainDynName = when {
+        dynFromIr != null -> dynFromIr
+        dynamicFields.any { it.name == "Vmemb" } -> "Vmemb"
+        else -> dynamicFields.first().name
     }
-    val vmembDesc = symbols.neuronFields[vmembName]!!
-    val dyn = DynArrays(
-        main = DynParamPlan(
-            field = vmembDesc.name,
-            bitWidth = vmembDesc.width,             // обычно d.potentialW
+
+    val allDynPlans = dynamicFields.map { nf ->
+        DynParamPlan(
+            field = nf.name,
+            bitWidth = nf.width,
             count = arch.dims.postsynCount
-        ),
-        extra = emptyList() // сюда можно положить дополнительные динамики, если появятся в IR/AST
+        )
+    }
+    val mainDynPlan  = allDynPlans.first { it.field == mainDynName }
+    val extraDynPlan = allDynPlans.filter { it.field != mainDynName }
+
+    val dyn = DynArrays(
+        main  = mainDynPlan,
+        extra = extraDynPlan
     )
 
     // ——— 5) Банк регистров: threshold/leakage/reset/… + служебные
@@ -374,6 +449,7 @@ fun buildLayoutPlan(
         }?.distinct()?.singleOrNull() ?: SynOpKind.ADD
 
 // ... селектор и выбор preferred/synOp — как у тебя ...
+    val emitDer = deriveEmitFromIr(arch, symbols, ir)
 
 // === ФАЗЫ (как у тебя сейчас) ===
     val phases = PhasePlans(
@@ -385,25 +461,27 @@ fun buildLayoutPlan(
             connects = mapOf(
                 "inFifo"   to "spike_in",
                 "selector" to "sel0",
-                "dyn"      to "Vmemb"
+                "dyn"      to mainDynName   // уже сделали динамику не жёстко «Vmemb»
             )
         ),
         neur = NeurPhasePlan(
-            ops = listOf(NeurOpSpec(NeurOpKind.SHR, regKey = "leakage")), // если в нейронных полях нет leakage — его дособерём
+            ops = listOf(NeurOpSpec(NeurOpKind.SHR, regKey = "leakage")),
             postsynCountRegKey = "postsynCount"
         ),
         emit = EmitPlan(
-            cmp = CmpKind.GE,
-            cmpRegKey = "threshold",
-            refractory = true,
-            resetRegKey = "reset",
-            outRole = "spike_out"
+            cmp         = emitDer.cmp,
+            cmpRegKey   = emitDer.cmpRegKey,    // напр. "Vthr" или "cmpImm_42"
+            refractory  = emitDer.refractory,
+            resetRegKey = emitDer.resetRegKey,   // напр. "Vrst" или "rstImm_0"
+            outRole     = "spike_out"
         )
     )
 
 // === БАНК РЕГИСТРОВ: теперь строим из symbols + phases ===
-    val regBank = buildRegBankFromSymbols(arch, symbols, phases)
-
+    val regBank = buildRegBankFromSymbols(
+        arch, symbols, phases,
+        extraRegs = emitDer.extraRegs          // <<— важное добавление
+    )
     return DefaultLayoutPlan(
         tick = tick,
         fifoIn = fifoIn,
