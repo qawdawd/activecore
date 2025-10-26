@@ -185,8 +185,8 @@ fun main() {
         modelName = "LIF_demo",
         nnType    = NeuralNetworkType.SFNN,
         dims      = NnDims(presynCount = 28*28, postsynCount = 128),
-        neuron    = NeuronParams(threshold = 1, reset = 0, leakage = 1),
-        numeric   = NumericLayout(weightWidth = 16, potentialWidth = 16)
+//        neuron    = NeuronParams(threshold = 1, reset = 0, leakage = 1),
+//        numeric   = NumericLayout(weightWidth = 16, potentialWidth = 16)
     )
 
     // 1) Твои транзакции — БЕЗ изменений
@@ -206,6 +206,7 @@ fun main() {
         addField("Vmemb", 16, NeuronFieldKind.DYNAMIC)
         addField("Vthr",  16, NeuronFieldKind.STATIC)
         addField("Vrst",  16, NeuronFieldKind.STATIC)
+        addField("leakage", 16, NeuronFieldKind.STATIC)
 
         opShrImm(dst = "Vmemb", aField = "Vmemb", shift = 1)
         val cond = ifGe("Vmemb", "Vthr")
@@ -271,5 +272,5 @@ fun dumpLayout(layout: LayoutPlan) {
 
     println("phases.neur.ops: ${layout.phases.neur.ops}  postsynCountRegKey=${layout.phases.neur.postsynCountRegKey}")
     println("phases.emit: ${layout.phases.emit}")
-    println("topology: ${layout.topology}")
+        println("topology: ${layout.topology}")
 }

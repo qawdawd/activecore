@@ -134,6 +134,80 @@ fun buildSynPack(synParams: List<SpikeFieldDesc>): SynPackPlan {
     return SynPackPlan(wordWidth = offset, fields = map)
 }
 
+private fun buildRegBankFromSymbols(
+    arch: SnnArch,
+    symbols: Symbols,
+    phases: PhasePlans
+): RegBankPlan {
+    val regs = mutableListOf<RegDesc>()
+
+    // 1) Берём только CONFIG-поля нейрона: STATIC (+ опц. REFRACTORY). Без EMIT_PREDICATE!
+    symbols.neuronFields.values
+        .filter { it.kind == NeuronFieldKind.STATIC || it.kind == NeuronFieldKind.REFRACTORY }
+        .forEach { nf ->
+            regs += RegDesc(name = nf.name, width = nf.width, init = "0")
+        }
+
+    // 2) Служебные рантайм-регистры
+    regs += RegDesc("postsynCount", arch.d.postsynIdxW, init = arch.dims.postsynCount.toString())
+    regs += RegDesc("baseAddr",     arch.d.weightAddrW, init = "0")
+
+    // 3) Соберём alias-карту: логические ключи фаз → реальные имена регов, если они есть
+    val alias = mutableMapOf<String, String>().apply {
+        // threshold → Vthr (если такое STATIC-поле есть)
+        if ("Vthr" in symbols.neuronFields) this["threshold"] = "Vthr"
+        // reset → Vrst
+        if ("Vrst" in symbols.neuronFields) this["reset"] = "Vrst"
+        // leakage → либо leakage, либо Vleak (как договоришься в транзакции)
+        when {
+            "leakage" in symbols.neuronFields -> this["leakage"] = "leakage"
+            "Vleak"   in symbols.neuronFields -> this["leakage"] = "Vleak"
+        }
+    }
+
+    // 4) Какие ключи реально нужны фазам
+    val needed = buildSet {
+        phases.neur.ops.mapNotNullTo(this) { it.regKey }
+        add(phases.emit.cmpRegKey)
+        phases.emit.resetRegKey?.let { add(it) }
+        add(phases.neur.postsynCountRegKey)
+    }
+
+    // 5) Не дублируем: если нужен логический ключ и есть alias → просто маппим,
+    // если нет ни alias, ни реального регистра — доcоздаём с безопасной шириной.
+    val haveNames = regs.map { it.name }.toMutableSet()
+    for (key in needed) {
+        val real = alias[key]
+        if (real != null) {
+            // alias указывает на уже существующий рег? (или появится в haveNames)
+            // ничего не добавляем, просто проложим mapApi ниже
+            continue
+        }
+        if (key !in haveNames) {
+            val w = when (key) {
+                "threshold" -> maxOf(arch.d.thresholdW, arch.d.potentialW) // часто хотят порог той же ширины, что Vmemb
+                "reset"     -> maxOf(arch.d.resetW, arch.d.potentialW)
+                "leakage"   -> arch.d.leakageW
+                "postsynCount" -> arch.d.postsynIdxW
+                "baseAddr"     -> arch.d.weightAddrW
+                else -> arch.d.potentialW
+            }
+            regs += RegDesc(key, w, init = "0")
+            haveNames += key
+        }
+    }
+
+    // 6) mapApiKeys: тождественные + алиасы (логическое → реальное)
+    val mapApi = buildMap {
+        regs.forEach { putIfAbsent(it.name, it.name) }  // identity для всех реальных имён
+        alias.forEach { (logical, real) -> put(logical, real) }
+    }
+
+    return RegBankPlan(regs = regs, mapApiKeys = mapApi)
+}
+
+
+
 /* ================================================================
  *  Построение DefaultLayoutPlan
  *  — статический план «что инстанцировать и как связать»
@@ -245,23 +319,23 @@ fun buildLayoutPlan(
     )
 
     // ——— 5) Банк регистров: threshold/leakage/reset/… + служебные
-    val regs = mutableListOf<RegDesc>()
-    regs += RegDesc("threshold", d.thresholdW, init = "0")
-    regs += RegDesc("leakage",   d.leakageW,   init = "1")  // в твоём примере SHR на 1 — ок положить 1
-    regs += RegDesc("reset",     d.resetW,     init = "0")
-    regs += RegDesc("postsynCount", d.postsynIdxW, init = arch.dims.postsynCount.toString())
-    regs += RegDesc("baseAddr",     d.weightAddrW, init = "0")
-    val regBank = RegBankPlan(
-        regs = regs,
-        mapApiKeys = mapOf(
-            // логические имена → реальные имена регов (если надо ремапить)
-            "threshold"     to "threshold",
-            "leakage"       to "leakage",
-            "reset"         to "reset",
-            "postsynCount"  to "postsynCount",
-            "baseAddr"      to "baseAddr"
-        )
-    )
+//    val regs = mutableListOf<RegDesc>()
+//    regs += RegDesc("threshold", d.thresholdW, init = "0")
+//    regs += RegDesc("leakage",   d.leakageW,   init = "1")  // в твоём примере SHR на 1 — ок положить 1
+//    regs += RegDesc("reset",     d.resetW,     init = "0")
+//    regs += RegDesc("postsynCount", d.postsynIdxW, init = arch.dims.postsynCount.toString())
+//    regs += RegDesc("baseAddr",     d.weightAddrW, init = "0")
+//    val regBank = RegBankPlan(
+//        regs = regs,
+//        mapApiKeys = mapOf(
+//            // логические имена → реальные имена регов (если надо ремапить)
+//            "threshold"     to "threshold",
+//            "leakage"       to "leakage",
+//            "reset"         to "reset",
+//            "postsynCount"  to "postsynCount",
+//            "baseAddr"      to "baseAddr"
+//        )
+//    )
 
     // ——— 6) Селектор синапсов
     val selector = SynSelPlan(
@@ -301,12 +375,13 @@ fun buildLayoutPlan(
 
 // ... селектор и выбор preferred/synOp — как у тебя ...
 
+// === ФАЗЫ (как у тебя сейчас) ===
     val phases = PhasePlans(
         syn = SynPhasePlan(
             op = synOp,
             gateByTick = true,
-            synParamField = preferred,          // напр. "w"
-            packedSlices = packedSlicesForSyn,  // <-- тут главная правка
+            synParamField = preferred,
+            packedSlices = packedSlicesForSyn,
             connects = mapOf(
                 "inFifo"   to "spike_in",
                 "selector" to "sel0",
@@ -314,7 +389,7 @@ fun buildLayoutPlan(
             )
         ),
         neur = NeurPhasePlan(
-            ops = listOf(NeurOpSpec(NeurOpKind.SHR, regKey = "leakage")),
+            ops = listOf(NeurOpSpec(NeurOpKind.SHR, regKey = "leakage")), // если в нейронных полях нет leakage — его дособерём
             postsynCountRegKey = "postsynCount"
         ),
         emit = EmitPlan(
@@ -325,6 +400,9 @@ fun buildLayoutPlan(
             outRole = "spike_out"
         )
     )
+
+// === БАНК РЕГИСТРОВ: теперь строим из symbols + phases ===
+    val regBank = buildRegBankFromSymbols(arch, symbols, phases)
 
     return DefaultLayoutPlan(
         tick = tick,
