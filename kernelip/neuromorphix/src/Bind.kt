@@ -46,7 +46,7 @@ data class BindingCtx(
 
 
 // План размещения/конфигурации компонентов БММ (Tick/FIFOs/StaticMem/DynamicMem/Selector/Phases/RegBank)
-interface LayoutPlan
+//interface LayoutPlan
 
 // Правила биндинга IR → интерфейсы компонентов (маршрутизация операций по фазам/компонентам)
 interface BindPlan

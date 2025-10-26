@@ -5,10 +5,14 @@ import hwast.*
 
 enum class SynOpKind { ADD, SUB, REPLACE }
 
+// стало:
 data class SynPhaseCfg(
     val name: String,
     val op: SynOpKind = SynOpKind.ADD,
-    val preIdxWidth: Int
+    val preIdxWidth: Int,
+    // ↓ новые поля (опциональные)
+    val synParamField: String? = null,         // "w", "tag", ... (когда слово упакованное)
+    val packedSlices: SynPackPlan? = null      // карта срезов, если слово packed
 )
 
 data class SynPhaseIF(
@@ -108,16 +112,27 @@ class SynapticPhase(private val instName: String = "syn_phase") {
             stateN.assign(S_RUN)
         }; g.endif()
 
-        // === RUN: на каждом шаге селектора выполняем операцию над dyn и wmem.dat_r ===
+// === RUN: на каждом шаге берём слово из wmem и применяем операцию ===
         g.begif(g.eq2(state, S_RUN)); run {
             busy.assign(1)
 
             dyn.rd_idx.assign(sel.postIdx_o)
 
+            // --- НОВОЕ: выбираем источник значения из памяти (упаковка/без упаковки)
+            val valueForOp =
+                if (cfg.packedSlices != null && cfg.synParamField != null) {
+                    val sl = cfg.packedSlices.sliceOf(cfg.synParamField)
+                    // срез [msb:lsb] из прочитанного слова памяти
+                    wmem.dat_r[sl.msb, sl.lsb]   // <-- это hw_var.get(msb:Int, lsb:Int)
+                } else {
+                    wmem.dat_r
+                }
+
+            // прежняя логика операции над dyn.rd_data и значением из памяти
             val newVal = when (cfg.op) {
-                SynOpKind.ADD     -> dyn.rd_data.plus(wmem.dat_r)
-                SynOpKind.SUB     -> dyn.rd_data.minus(wmem.dat_r)
-                SynOpKind.REPLACE -> wmem.dat_r
+                SynOpKind.ADD     -> dyn.rd_data.plus(valueForOp)
+                SynOpKind.SUB     -> dyn.rd_data.minus(valueForOp)
+                SynOpKind.REPLACE -> valueForOp
             }
 
             dyn.wr_idx.assign(sel.postIdx_o)
